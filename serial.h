@@ -24,6 +24,7 @@
 #define SERIAL_MODE_SERIAL_AW1    4  // Connected to serial cable (AdvWars emulation mode)
 #define SERIAL_MODE_SERIAL_AW2    5  // Connected to serial cable (AdvWars emulation mode)
 #define SERIAL_MODE_AUTO          6  // Choose best fit automatically
+#define SERIAL_MODE_SERIAL_CABLE  7  // Connected to serial cable (real time, protocol agnostic)
 
 extern int serial_mode;
 
@@ -58,6 +59,18 @@ void serialaw_frame_update(void);
 void serialaw_master_send(void);
 bool serialaw_update(unsigned cycles);
 void serialaw_net_receive(const void* buf, size_t len, uint16_t client_id);
+
+// Real time link cable
+void serialcable_reset(void);
+void serialcable_session_reset(void);
+void serialcable_peer_disconnected(uint16_t client_id);
+void serialcable_mode_changed(void);
+u16 serialcable_mul_siocnt(void);
+u16 serialcable_normal_write(u16 oldval, u16 newval);
+u16 serialcable_multi_write(u16 oldval, u16 newval);
+u32 serialcable_next_event(void);
+bool serialcable_update(unsigned cycles);
+void serialcable_net_receive(const void* buf, size_t len, uint16_t client_id);
 
 // GBP interface
 u32 gbp_transfer(u32 value);

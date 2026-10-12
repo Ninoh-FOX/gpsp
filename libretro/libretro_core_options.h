@@ -134,9 +134,21 @@ struct retro_core_option_definition option_defs_us[] = {
          { "mul_poke", "Link Cable - Pokemon Gen3 mode" },
          { "mul_aw1",  "Link Cable - Advance Wars 1 mode" },
          { "mul_aw2",  "Link Cable - Advance Wars 2 mode" },
+         { "mul_cable", "Cable Link (real time)" },
          { NULL, NULL },
       },
       "auto"
+   },
+   {
+      "gpsp_cable_boot",
+      "Cable Link to Boot",
+      "Only used by the 'Cable Link (real time)' mode. When enabled, joining a netplay session as a client resets the game, as if the console was switched on with the link cable already plugged in. Needed by games that only detect the link at boot (i.e. Mario Kart: Super Circuit, Zelda: Four Swords).",
+      {
+         { "disabled", NULL },
+         { "enabled",  NULL },
+         { NULL, NULL },
+      },
+      "disabled"
    },
    {
       "gpsp_rumble",

@@ -94,12 +94,17 @@ cpu_alert_type write_rcnt(u16 value) {
       serialproto_reset();   // Reset multiplayer emulation states.
 
     // Update SI/SD/ID/Error fields
-    write_ioreg(REG_SIOCNT, (read_ioreg(REG_SIOCNT) & 0xFF83) | serial_mul_siocnt());
+    write_ioreg(REG_SIOCNT, (read_ioreg(REG_SIOCNT) & 0xFF83) |
+      (serial_mode == SERIAL_MODE_SERIAL_CABLE ? serialcable_mul_siocnt() :
+                                                 serial_mul_siocnt()));
     break;
 
   case SERIAL_MODE_NORMAL:
     break;
   };
+
+  if (serial_mode == SERIAL_MODE_SERIAL_CABLE)
+    serialcable_mode_changed();   // Let the other consoles know.
 
   return CPU_ALERT_NONE;
 }
@@ -158,11 +163,19 @@ cpu_alert_type write_siocnt(u16 value) {
         serial_irq_cycles = CLOCK_CYC_64KHZ_32BIT;
       }
     }
+    else if (serial_mode == SERIAL_MODE_SERIAL_CABLE)
+      newval = serialcable_normal_write(oldval, newval);
     break;
 
   case SERIAL_MODE_MULTI:
     if (pvmode != nwmode)
       serialproto_reset();   // Reset multiplayer emulation states.
+
+    if (serial_mode == SERIAL_MODE_SERIAL_CABLE) {
+      // Transfers are exchanged with the real consoles as they happen.
+      newval = serialcable_multi_write(oldval, newval);
+      break;
+    }
 
     // Update SI/SD/ID/Error fields
     newval = (newval & 0xFF83) | serial_mul_siocnt();
@@ -186,11 +199,16 @@ cpu_alert_type write_siocnt(u16 value) {
   // Update reg with its new value
   write_ioreg(REG_SIOCNT, newval);
 
+  if (serial_mode == SERIAL_MODE_SERIAL_CABLE)
+    serialcable_mode_changed();   // Let the other consoles know.
+
   return CPU_ALERT_NONE;
 }
 
 // How many cycles until the next serial event happens. Return MAX otherwise.
 u32 serial_next_event() {
+  if (serial_mode == SERIAL_MODE_SERIAL_CABLE)
+    return serialcable_next_event();
   if (serial_irq_cycles)
     return serial_irq_cycles;
   return ~0U;
@@ -200,6 +218,9 @@ u32 serial_next_event() {
 bool update_serial(unsigned cycles) {
   // Might wanna check if the connected device has some update (IRQ).
   switch (serial_mode) {
+  case SERIAL_MODE_SERIAL_CABLE:
+    // Has its own transfer scheduling.
+    return serialcable_update(cycles);
   case SERIAL_MODE_RFU:
     if (rfu_update(cycles))
       return true;

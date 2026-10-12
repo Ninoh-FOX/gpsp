@@ -123,6 +123,8 @@ int sprite_limit = 1;
 static int rtc_mode = FEAT_AUTODETECT;
 static int rumble_mode = FEAT_AUTODETECT;
 static int serial_setting = SERIAL_MODE_AUTO;
+static bool cable_boot = false;            /* Reset clients when the cable gets plugged */
+static bool cable_boot_pending = false;
 
 u32 idle_loop_target_pc = 0xFFFFFFFF;
 u32 translation_gate_target_pc[MAX_TRANSLATION_GATES];
@@ -485,6 +487,15 @@ void netpacket_poll_receive() {
     netpacket_pollrcv_fn_ptr();
 }
 
+bool netpacket_active(void) {
+  return netpacket_send_fn_ptr != NULL;
+}
+
+// Host (wall clock) time, used to bound the waits on the network.
+u64 netpacket_time_usec(void) {
+  return (u64)perf_cb.get_time_usec();
+}
+
 void netpacket_send(uint16_t client_id, const void *buf, size_t len) {
   // Force all packets to be flushed ASAP, to minimize latency.
   if (netpacket_send_fn_ptr)
@@ -496,12 +507,28 @@ static void netpacket_start(uint16_t client_id, retro_netpacket_send_t send_fn, 
   netpacket_pollrcv_fn_ptr = poll_receive_fn;
   netplay_num_clients = 0;
   netplay_client_id = client_id;
+
+  if (serial_mode == SERIAL_MODE_SERIAL_CABLE) {
+    serialcable_session_reset();
+    // "Cable Link to Boot": the client console is power cycled with the
+    // cable already plugged, so that games probing the link at boot see it.
+    if (client_id && cable_boot)
+      cable_boot_pending = true;
+  }
 }
 
 // Netplay session ends.
 static void netpacket_stop() {
   netpacket_send_fn_ptr = NULL;
   netpacket_pollrcv_fn_ptr = NULL;
+
+  if (serial_mode == SERIAL_MODE_SERIAL_CABLE) {
+    // Cable unplugged: we are a lone console again.
+    netplay_num_clients = 0;
+    netplay_client_id = 0;
+    cable_boot_pending = false;
+    serialcable_session_reset();
+  }
 }
 
 static void netpacket_receive(const void* buf, size_t len, uint16_t client_id) {
@@ -516,6 +543,9 @@ static void netpacket_receive(const void* buf, size_t len, uint16_t client_id) {
   case SERIAL_MODE_SERIAL_AW2:
     serialaw_net_receive(buf, len, client_id);
     break;
+  case SERIAL_MODE_SERIAL_CABLE:
+    serialcable_net_receive(buf, len, client_id);
+    break;
   };
 }
 
@@ -529,6 +559,7 @@ static bool netpacket_connected(uint16_t client_id) {
      MAX_SERMULT_NETPLAYERS,   // SERIAL_MODE_SERIAL_AW1
      MAX_SERMULT_NETPLAYERS,   // SERIAL_MODE_SERIAL_AW2
      0,                        // SERIAL_MODE_AUTO
+     MAX_SERMULT_NETPLAYERS,   // SERIAL_MODE_SERIAL_CABLE
   };
   const u32 max_clients = maxpl[serial_mode] - 1U;
 
@@ -541,6 +572,8 @@ static bool netpacket_connected(uint16_t client_id) {
 
 static void netpacket_disconnected(uint16_t client_id) {
   netplay_num_clients--;
+  if (serial_mode == SERIAL_MODE_SERIAL_CABLE)
+    serialcable_peer_disconnected(client_id);
 }
 
 const struct retro_netpacket_callback netpacket_iface = {
@@ -961,6 +994,11 @@ static void check_variables(bool started_from_load)
    dynarec_enable = 0;
 #endif
 
+   var.key   = "gpsp_cable_boot";
+   var.value = NULL;
+   cable_boot = environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value &&
+                !strcmp(var.value, "enabled");
+
    var.key = "gpsp_rtc_time_source";
    var.value = NULL;
    {
@@ -1022,6 +1060,8 @@ static void check_variables(bool started_from_load)
            serial_setting = SERIAL_MODE_SERIAL_AW1;
         else if (!strcmp(var.value, "mul_aw2"))
            serial_setting = SERIAL_MODE_SERIAL_AW2;
+        else if (!strcmp(var.value, "mul_cable"))
+           serial_setting = SERIAL_MODE_SERIAL_CABLE;
         else if (!strcmp(var.value, "gbp"))
            serial_setting = SERIAL_MODE_GBP;
         else
@@ -1368,6 +1408,13 @@ size_t retro_get_memory_size(unsigned id)
 void retro_run(void)
 {
    bool updated = false;
+
+   if (cable_boot_pending)
+   {
+      /* A netplay client just plugged the cable with "Cable Link to Boot" */
+      cable_boot_pending = false;
+      reset_gba();
+   }
 
    input_poll_cb();
    update_input();
