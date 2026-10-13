@@ -25,24 +25,31 @@
 // multiplayer transfer:
 //
 //   parent                                child(ren)
-//                             <--------   REPLY(seq, child word)    [early]
-//     XFER(seq, parent word)  -------->   start the transfer
-//                             <--------   REPLY(seq, child word)    [if not sent yet]
+//     XFER(seq, parent word)  -------->   start the transfer, latch its word
+//                             <--------   REPLY(seq, child word)
 //     [transfer time elapses, waits for the replies if they are late]
 //     DONE(seq, all 4 words)  -------->   fill SIOMULTIx, raise serial IRQ
 //     raise serial IRQ
 //
-// A network round trip per transfer is what makes this slow, so we avoid as
-// many as we can without changing what the games see:
+// With only two consoles the child knows both words as soon as XFER gets
+// there, so it finishes the transfer on its own and no DONE is sent.
 //
-//  - Games load their next word right after a transfer ends (serial IRQ).
-//    As soon as a child does so, it sends the word for the *next* transfer
-//    without waiting to be asked. The parent usually has it by the time it
-//    needs it. If the game did not write anything, the word is sampled when
-//    the transfer starts, as usual.
-//  - With only two consoles the child knows both words as soon as XFER gets
-//    there, so it finishes the transfer on its own and no DONE is needed.
-//    The transfers then overlap: two of them fit in a single round trip.
+// A child word is latched once, when the transfer gets to the child, and it
+// is never changed afterwards: both ends always agree on what was exchanged.
+//
+// The above costs a network round trip per transfer, and games that check
+// what the other console answers to each word (ie. Pokemon) break as soon
+// as a single one is off: words cannot be delayed or made up. There is one
+// thing that can be done though. Most games load their next word right
+// after a transfer ends (serial IRQ) and leave it alone until the next one
+// is over. A child whose game has been doing exactly that for a good while
+// sends that word as soon as it is loaded ("early"), without waiting for
+// the transfer to start: the parent usually has it by the time it needs it,
+// and two transfers fit in a round trip. Every early word is still checked
+// against what the game has when the transfer does start: if it ever
+// differs (that one word was wrong, both consoles saw it though) the child
+// goes back to waiting for the transfers, for the rest of the session.
+// Games that load their words in any other way never get to use this.
 //
 // Normal (8/32 bit) mode is a plain XFER/REPLY swap between the parent and
 // player 2.
@@ -56,6 +63,32 @@
 // where they still answer at once. Children also line up the end of their
 // frames with the parent's, so that everybody goes to sleep at the same time
 // and nobody is missed.
+//
+// This has a catch: a child that is held does not run its game, and a
+// transfer must not get to a child before its game had the time to load the
+// word (it would send the previous one again). So a child first gives its
+// game the very same time the parent's one had between the two transfers,
+// and only then latches it.
+//
+// That time is paid by the parent, waiting, on top of the round trip. To
+// save it a child does not sit still after a transfer: it goes on for as
+// long as the parent took to start the last one, expecting the next to be
+// alike (games send their words at a steady pace). When it is, the child is
+// already there and answers at once. The word is still the one its game had
+// at the very moment the transfer started for the parent: if it was loaded
+// after that, the previous one is sent.
+//
+// Sleeping at the same time is not enough, the consoles also have to wake
+// up together, and that is up to the frontends: each one runs its frames on
+// its own schedule (display, audio), with whatever phase between them. A
+// child that is done with a frame and leaves is not back until its own next
+// frame is due, even if the parent starts the next one right away: the
+// parent then loses that time on every frame. For this reason the parent
+// says, at the end of each frame, when it expects to run the next one. A
+// child that would not be back by then does not leave: it runs the next
+// frame too in the same go (its video skips a frame), which gets it ahead of
+// its own schedule: from then on it comes back early and waits for the
+// parent inside the core, as it should.
 //
 // All waits are bounded: if a peer stops answering (paused, menu, gone) we
 // stop waiting for it and it simply reads as a console that is not
@@ -76,13 +109,13 @@ void netpacket_poll_receive();
 bool netpacket_active(void);
 u64 netpacket_time_usec(void);
 
-#define NET_CABLE_HEADER       0x4d434232   // MCB2 (Multiplayer CaBle, v2)
+#define NET_CABLE_HEADER       0x4d434235   // MCB5 (Multiplayer CaBle, v5)
 
 #define PKT_STATUS             1    // a: status flags
 #define PKT_XFER               2    // a: data, b: transfer config, c: parent clock
 #define PKT_REPLY              3    // a: data, b: transfer mode
 #define PKT_DONE               4    // a: words 0/1, b: words 2/3, c: parent clock
-#define PKT_TICK               5    // a: tick flags, c: parent clock
+#define PKT_TICK               5    // a: tick flags, b: time to next frame, c: parent clock
 
 // Status flags
 #define ST_MULTI               0x1  // Console is in multiplayer mode
@@ -92,25 +125,41 @@ u64 netpacket_time_usec(void);
 
 // Tick flags
 #define TICK_ACTIVE            0x1  // The link is in use, keep up with the parent
-#define TICK_FRAME_END         0x2  // Parent just finished a frame
+#define TICK_FRAME_END         0x2  // Parent just finished a frame, and it expects to
+                                    // start the next one in b-1 microseconds (if b)
 
-// Transfer modes (XFER config, bits 0..7)
+// XFER config. Bits 0..7: transfer mode.
+//   Multiplayer: bits 8..9 baud rate, 20..23 consoles
+//   Normal:      bit 16 set for 32 bit transfers
 #define XMODE_MULTI            0
 #define XMODE_NORMAL           1
 
-#define CBL_QUEUE_SIZE         16
+#define CBL_QUEUE_SIZE         256
 #define CBL_POLL_CYCLES        4096      // Children poll the network ~68 times per frame
 #define CBL_TICK_CYCLES        35112     // Parent reports its clock 8 times per frame
 #define CBL_ACTIVE_CYCLES      (60 * CBL_FRAME_CYCLES)  // The link is in use for ~1s after a transfer
 #define CBL_SLACK_CYCLES       2048      // How far past the parent clock a child can run
 #define CBL_FRAME_CYCLES        280896
+#define CBL_ALIGN_CYCLES       (CBL_FRAME_CYCLES / 16)   // Frame alignment step
+#define CBL_AHEAD_MAX_CYCLES   (CBL_FRAME_CYCLES / 4)    // Longest wait for a transfer we get ahead of
+#define CBL_AHEAD_MARGIN       256       // ...and how much further we go, just in case
+#define CBL_EARLY_STREAK       512       // Well behaved transfers it takes to send words early
 #define CBL_MAX_LAG_CYCLES     CBL_FRAME_CYCLES   // A child that fell behind does not owe more than this
-#define CBL_SETTLE_CYCLES      128       // Let the game finish writing its word
 
 // Host-time limits for the blocking waits (microseconds).
-#define CBL_PARENT_TIMEOUT_US  100000    // Waiting for the children words
-#define CBL_CHILD_TIMEOUT_US   50000     // Waiting for the parent to catch up
-#define CBL_MAX_WAIT_POLLS     2000000   // Safety net if the host has no usable clock
+// Giving up on a word means the game gets a console that is not there, which
+// can be the end of the link: it must not happen just because the network
+// stalled for a moment (WiFi does, for as long as a beacon interval, ~100ms).
+#define CBL_PARENT_TIMEOUT_US  500000    // Waiting for the children words
+#define CBL_CHILD_TIMEOUT_US   250000    // Waiting for the parent to catch up
+#define CBL_NAP_AFTER_US       8000      // Peer is stuck: stop burning CPU while we wait
+#define CBL_NAP_US             500
+#define CBL_NOCLOCK_POLLS      20000     // Clock did not move in this many polls: there is none
+#define CBL_NOCLOCK_MAX_POLLS  100000    // Limit for the waits in that case
+#define CBL_FRAME_US           16743     // A frame (59.73 fps)
+#define CBL_STAY_MIN_US        2000      // Parent would wait this long: do not leave
+#define CBL_STAY_MAX_US        40000     // ...unless it is not coming back soon
+#define CBL_STAY_MARGIN_US     1000
 
 // Transfer timings, see serial.c
 static const u16 multi_cycles[4] = { 31457, 7864, 5242, 2621 };
@@ -129,8 +178,8 @@ static struct {
     u8 present;                  // Console is plugged to the cable
     u8 flags;                    // Last reported status
     u8 responsive;               // Answered in time last time we waited for it
-    // Words we were sent: the one for the ongoing transfer and, possibly,
-    // the one for the next transfer (indexed by the lowest sequence bit).
+    // The words it sent, for the ongoing transfer and (early) for the next
+    // one, indexed by the lowest bit of the sequence number.
     struct {
       u8 valid;
       u8 mode;                   // Kind of transfer it was meant for
@@ -143,6 +192,10 @@ static struct {
   u8 link_dirty;                 // Line levels might have changed
   u32 clock;                     // Emulated time
   u32 poll_cycles;
+
+  // Host time of our frames (microseconds)
+  u64 f_entry;                   // Current frame started
+  u8 f_stayed;                   // Extra frames run since we got in
 
   // Parent
   u8 m_busy;                     // Transfer in progress
@@ -157,25 +210,41 @@ static struct {
 
   // Child
   cable_event queue[CBL_QUEUE_SIZE];
-  u8 q_head, q_count;
+  u16 q_head, q_count;
   u8 s_inxfer;                   // Transfer in progress
   u8 s_local;                    // ...that we finish ourselves (no DONE needed)
   u8 s_live;                     // Parent is using the link and reporting its clock
   u8 s_resync;                   // Parent is back, adopt its clock
-  u8 s_wrote;                    // Game loaded a new word to send
-  u8 s_sent;                     // We sent our word...
+  u8 s_fin_valid;
+  u32 s_fin_pclock;              // Parent clock when the last transfer ended
+  u32 s_since_fin;               // Time since it ended for us
+  u8 s_replied;                  // Our word for the ongoing transfer was sent
   u8 s_pframe_valid;
-  u16 s_sent_word;
-  u32 s_sent_seq;                // ...for this transfer
   u16 s_pword;                   // Parent word of the ongoing transfer
+  u16 s_word;                    // ...and ours, once sent
+  u8 s_latched;                  // The word to send is not what the game has now...
+  u16 s_lword;                   // ...but this one
+  u16 s_streak;                  // Transfers in a row whose word was loaded as expected
+  u8 s_early_off;                // An early word was wrong: no more of them
+  u8 s_epending;                 // The game just loaded a word
+  u8 s_esent;                    // A word was sent early...
+  u32 s_eseq;                    // ...for this transfer
+  u16 s_eword;
+  u8 s_ahead;                    // Getting ahead of the next transfer
+  u32 s_ahead_until;             // ...up to this point of the parent clock
+  u32 s_spacing;                 // Time the parent took to start the last transfer
+  u8 s_wcount;                   // Words the game loaded since the last transfer
+  u16 s_wprev;                   // The one before the last
+  u32 s_wtime;                   // When the last one was loaded (as s_since_fin)
   u32 s_seq;                     // Last transfer seen
   u32 s_gap;                     // Time until our next word can be sampled
-  u32 s_settle;                  // Time until the written word is stable
   u32 s_xferleft;                // Remaining time of the ongoing transfer
   u32 s_wordcyc;                 // Duration of one word of the ongoing transfer
   u32 s_time;                    // Our position on the parent clock
   u32 s_pclock;                  // Parent clock, as last reported
   u32 s_pframe;                  // Parent clock at the end of its last frame
+  u8 s_pnext_valid;
+  u64 s_pnext;                   // Host time the parent expects to run its next frame
 } cbl;
 
 static void cable_send(u16 client_id, u32 type, u32 seq, u32 a, u32 b, u32 c) {
@@ -260,9 +329,12 @@ void serialcable_reset(void) {
   cbl.q_head = cbl.q_count = 0;
   cbl.s_inxfer = 0;
   cbl.s_gap = 0;
-  cbl.s_settle = 0;
-  cbl.s_wrote = 0;
-  cbl.s_sent = 0;
+  cbl.s_fin_valid = 0;
+  cbl.s_ahead = 0;
+  cbl.s_wcount = 0;
+  cbl.s_streak = 0;
+  cbl.s_epending = cbl.s_esent = 0;
+  cbl.s_replied = 0;
   cbl.status_sent = ST_UNKNOWN;
   cbl.link_dirty = 1;
 }
@@ -287,12 +359,43 @@ void serialcable_mode_changed(void) {
   cable_sync_status();
 }
 
-// The game loaded a word to send in multiplayer mode (SIOMLT_SEND).
-void serialcable_send_written(void) {
+// The game is loading a word to send in multiplayer mode (SIOMLT_SEND),
+// "oldval" is the one that was there.
+void serialcable_send_written(u16 oldval) {
   if (ME) {
-    cbl.s_wrote = 1;
-    cbl.s_settle = CBL_SETTLE_CYCLES;
+    if (cbl.s_wcount < 2)
+      cbl.s_wcount++;
+    cbl.s_wprev = oldval;
+    cbl.s_wtime = cbl.s_since_fin;
+    cbl.s_epending = !cbl.s_inxfer;
   }
+}
+
+// Waiting on the network: tells when to give up. The host clock is not
+// always there (it reads zero forever), so the polls are counted too.
+typedef struct {
+  u64 t0;
+  u32 polls;
+} cable_wait_t;
+
+static bool cable_wait_step(cable_wait_t *w, u32 timeout_us) {
+  u64 elapsed;
+  if (!w->polls++) {
+    w->t0 = netpacket_time_usec();
+    return true;
+  }
+  elapsed = netpacket_time_usec() - w->t0;
+  if (elapsed > timeout_us)
+    return false;
+  if (!elapsed && w->polls > CBL_NOCLOCK_POLLS)
+    return w->polls < CBL_NOCLOCK_MAX_POLLS;
+#if defined(__unix__) || defined(__linux__) || defined(__APPLE__)
+  // Answers take a couple of ms at most. Past that the other console is
+  // stuck somewhere (menu, pause), and there is no point in spinning.
+  if (elapsed > CBL_NAP_AFTER_US)
+    usleep(CBL_NAP_US);
+#endif
+  return true;
 }
 
 // A transfer starts: children are told our clock along with it.
@@ -354,14 +457,20 @@ u16 serialcable_multi_write(u16 oldval, u16 newval) {
 
     if (cbl.m_mask) {
       cable_send(RETRO_NETPACKET_BROADCAST, PKT_XFER, cbl.m_seq, cbl.m_send,
-                 XMODE_MULTI | ((newval & 0x3) << 8) | (count << 24), cbl.clock);
+                 XMODE_MULTI | ((newval & 0x3) << 8) | (cbl.m_mask << 20),
+                 cbl.clock);
       parent_xfer_started();
     }
   }
   return newval;
 }
 
-// Whether a console sent its word for the ongoing transfer.
+// Whether a console takes part in the ongoing transfer.
+static bool parent_expects(u32 i) {
+  return (cbl.m_mask & (1 << i)) && cbl.peer[i].present;
+}
+
+// Whether its word got here.
 static bool parent_has_reply(u32 i) {
   return cbl.peer[i].reply[cbl.m_seq & 1].valid &&
          cbl.peer[i].reply[cbl.m_seq & 1].seq == cbl.m_seq &&
@@ -372,26 +481,22 @@ static bool parent_has_reply(u32 i) {
 static u32 parent_missing(void) {
   u32 i, missing = 0;
   for (i = 1; i <= 3; i++)
-    if ((cbl.m_mask & (1 << i)) && cbl.peer[i].present &&
-        cbl.peer[i].responsive && !parent_has_reply(i))
+    if (parent_expects(i) && cbl.peer[i].responsive && !parent_has_reply(i))
       missing |= 1 << i;
   return missing;
 }
 
 // The transfer time is over, collect the words and finish it.
 static bool parent_complete(void) {
-  u32 i, missing, polls = 0;
+  u32 i, missing;
   u16 siocnt;
-  u64 t0 = 0;
+  cable_wait_t wait = { 0, 0 };
 
   // The answers are usually here already. If not, hold the console until
   // they arrive: that is what keeps the transfer consistent on both ends.
   // (Receiving packets re-enters serialcable_net_receive)
   while ((missing = parent_missing())) {
-    if (!polls)
-      t0 = netpacket_time_usec();
-    else if (netpacket_time_usec() - t0 > CBL_PARENT_TIMEOUT_US ||
-             polls > CBL_MAX_WAIT_POLLS) {
+    if (!cable_wait_step(&wait, CBL_PARENT_TIMEOUT_US)) {
       // Do not stall again until they show signs of life.
       for (i = 1; i <= 3; i++)
         if (missing & (1 << i))
@@ -399,7 +504,6 @@ static bool parent_complete(void) {
       CBL_DEBUG_LOG("Transfer %u timed out (missing mask %x)\n", cbl.m_seq, missing);
       break;
     }
-    polls++;
     netpacket_poll_receive();
   }
 
@@ -407,11 +511,11 @@ static bool parent_complete(void) {
   siocnt = read_ioreg(REG_SIOCNT) & ~0x0080;
 
   if (cbl.m_mode == XMODE_MULTI) {
-    u16 w[4];
-    w[0] = cbl.m_send;
+    u32 w[4];
+    w[0] = cbl.m_send & 0xFFFF;
     for (i = 1; i <= 3; i++)
-      w[i] = ((cbl.m_mask & (1 << i)) && parent_has_reply(i)) ?
-             cbl.peer[i].reply[cbl.m_seq & 1].data : 0xFFFF;
+      w[i] = (parent_expects(i) && parent_has_reply(i)) ?
+             (cbl.peer[i].reply[cbl.m_seq & 1].data & 0xFFFF) : 0xFFFF;
     for (i = 0; i <= 3; i++)
       write_ioreg(REG_SIOMULTI0 + i, w[i]);
 
@@ -423,7 +527,7 @@ static bool parent_complete(void) {
     }
   }
   else {
-    u32 data = ((cbl.m_mask & 0x2) && parent_has_reply(1)) ?
+    u32 data = (parent_expects(1) && parent_has_reply(1)) ?
                cbl.peer[1].reply[cbl.m_seq & 1].data : 0xFFFFFFFF;
     if (cbl.m_bits32) {
       write_ioreg(REG_SIODATA32_L, data & 0xFFFF);
@@ -459,34 +563,56 @@ static void parent_tick(unsigned cycles) {
 
 // Block (for a short while) until the parent sends something.
 static bool child_wait(u32 timeout_us) {
-  u32 polls = 0;
   const u32 pclock = cbl.s_pclock;
-  const u64 t0 = netpacket_time_usec();
+  cable_wait_t wait = { 0, 0 };
   while (!cbl.q_count && cbl.s_live && cbl.s_pclock == pclock) {
-    if (netpacket_time_usec() - t0 > timeout_us || ++polls > CBL_MAX_WAIT_POLLS)
+    if (!cable_wait_step(&wait, timeout_us))
       return false;
     netpacket_poll_receive();
   }
   return true;
 }
 
-// Whether our word for the given transfer is already on its way.
-static bool child_word_sent(u32 seq) {
-  return cbl.s_sent && cbl.s_sent_seq == seq;
+// Latch the word the game wants to send and hand it to the parent. It is
+// final: whatever the game loads from now on goes in the next transfer.
+static void child_send_word(void) {
+  const u16 word = cbl.s_latched ? cbl.s_lword :
+                   in_multi_mode() ? read_ioreg(REG_SIOMLT_SEND) : 0xFFFF;
+
+  // Words can be sent early as long as the game loads one, and only one,
+  // after each transfer and before the next one starts.
+  if (cbl.s_wcount == 1 && !cbl.s_latched)
+    cbl.s_streak += (cbl.s_streak < CBL_EARLY_STREAK);
+  else if (cbl.s_wcount)
+    cbl.s_streak = 0;
+
+  if (cbl.s_esent && cbl.s_eseq == cbl.s_seq) {
+    // The parent has our word already. It is too late if it was not right.
+    if (word != cbl.s_eword) {
+      CBL_DEBUG_LOG("Early word for %u was wrong, no more of them\n", cbl.s_seq);
+      cbl.s_early_off = 1;
+    }
+    cbl.s_word = cbl.s_eword;
+  }
+  else {
+    cbl.s_word = word;
+    cable_send(0, PKT_REPLY, cbl.s_seq, cbl.s_word, XMODE_MULTI, 0);
+  }
+  cbl.s_esent = 0;
 }
 
-// Sample the word the game wants to send and hand it to the parent.
-static void child_send_word(u32 seq) {
-  const u16 word = in_multi_mode() ? read_ioreg(REG_SIOMLT_SEND) : 0xFFFF;
-
-  cbl.s_wrote = 0;
-  if (child_word_sent(seq) && cbl.s_sent_word == word)
-    return;
-
-  cbl.s_sent = 1;
-  cbl.s_sent_seq = seq;
-  cbl.s_sent_word = word;
-  cable_send(0, PKT_REPLY, seq, word, XMODE_MULTI, 0);
+// The game loaded a word and no transfer is going on: if it has been doing
+// that every time it is the one for the next transfer, the parent can have
+// it right now.
+static void child_send_early(void) {
+  cbl.s_epending = 0;
+  if (!cbl.s_inxfer && !cbl.q_count && cbl.s_wcount == 1 && cbl.s_live &&
+      cbl.s_streak >= CBL_EARLY_STREAK && !cbl.s_early_off && in_multi_mode()) {
+    cbl.s_esent = 1;
+    cbl.s_eseq = cbl.s_seq + 1;
+    cbl.s_eword = read_ioreg(REG_SIOMLT_SEND);
+    cable_send(0, PKT_REPLY, cbl.s_eseq, cbl.s_eword, XMODE_MULTI, 0);
+  }
 }
 
 // A multiplayer transfer is over: here are all the words.
@@ -497,6 +623,8 @@ static bool child_finish(u16 w0, u16 w1, u16 w2, u16 w3) {
   // On the wire our word is not sampled until one word time into the next
   // transfer: give the game that same time to load its next word.
   cbl.s_gap = cbl.s_wordcyc;
+  cbl.s_since_fin = 0;
+  cbl.s_wcount = 0;
 
   if (!in_multi_mode())
     return false;
@@ -510,29 +638,92 @@ static bool child_finish(u16 w0, u16 w1, u16 w2, u16 w3) {
   return (siocnt & 0x4000) != 0;
 }
 
+// We are the only child: the words on the wire are the parent's and the one
+// we sent, which is what the parent is using too.
+static bool child_finish_local(void) {
+  u16 w[4] = { cbl.s_pword, 0xFFFF, 0xFFFF, 0xFFFF };
+
+  if (cbl.s_replied)
+    w[ME] = cbl.s_word;
+
+  return child_finish(w[0], w[1], w[2], w[3]);
+}
+
+// The parent clock is (again) known: take our place on it.
+static void child_sync(void) {
+  if (cbl.s_live && cbl.s_resync) {
+    cbl.s_resync = 0;
+    cbl.s_time = cbl.s_pclock;
+  }
+}
+
 // The parent started a transfer.
 static bool child_xfer(const cable_event *ev) {
   const u32 mode = ev->b & 0xFF;
   u16 siocnt = read_ioreg(REG_SIOCNT);
 
-  cbl.s_seq = ev->seq;
-
   if (mode == XMODE_MULTI) {
-    const u32 children = (ev->b >> 24) & 0x3;
-    const s32 late = (s32)(cbl.s_time - ev->c);
+    const u32 mask = (ev->b >> 20) & 0xE;
+    const u32 children = ((mask >> 1) & 1) + ((mask >> 2) & 1) + ((mask >> 3) & 1);
+    u32 wait = 0;
 
+    if (!(mask & (1 << ME)))
+      return false;       // The parent does not know about us yet.
+
+    // The parent started this transfer some time after the previous one
+    // ended. Our game gets that same time, it might need it to load the
+    // word.
+    cbl.s_latched = 0;
+    cbl.s_spacing = ~0U;
+    if (cbl.s_fin_valid) {
+      const u32 spacing = ev->c - cbl.s_fin_pclock;
+      if (spacing <= CBL_MAX_LAG_CYCLES) {
+        cbl.s_spacing = spacing;
+        if (spacing > cbl.s_since_fin)
+          wait = spacing - cbl.s_since_fin;
+        else if (cbl.s_wcount && in_multi_mode() &&
+                 cbl.s_wtime > MAX(spacing, cbl.s_wordcyc)) {
+          // We are past the point where our word was taken, and the game
+          // loaded another one since: it is for the next transfer. (If it
+          // did so twice we do not know better)
+          cbl.s_latched = 1;
+          cbl.s_lword = (cbl.s_wcount == 1) ? cbl.s_wprev : read_ioreg(REG_SIOMLT_SEND);
+        }
+      }
+    }
+    // A transfer is where both games are known to be at the same point:
+    // ours will be at the parent clock of its start once that wait is over.
+    // Whatever our clock says otherwise is what the frame alignment wants
+    // us to make up for (transfers are what drives us when there are many
+    // of them, the hold has no say then): run some more if we are behind,
+    // or a bit less if we are ahead (never by much, the game needs its time).
+    if (cbl.s_live && !cbl.s_resync) {
+      s32 behind = (s32)(ev->c - wait - cbl.s_time);
+      if (behind > CBL_SLACK_CYCLES)          // (Clocks are not that accurate)
+        wait += MIN((u32)behind, CBL_ALIGN_CYCLES);
+      else if (behind < -CBL_SLACK_CYCLES) {
+        const u32 less = MIN((u32)-behind, wait / 2);
+        wait -= less;
+        behind += less;
+        if (behind < -CBL_ALIGN_CYCLES * 2)   // That is not us: the clock is wrong.
+          cbl.s_time += behind;
+      }
+    }
+
+    cbl.s_seq = ev->seq;
     cbl.s_wordcyc = multi_cycles[(ev->b >> 8) & 0x3];
-    cbl.s_xferleft = cbl.s_wordcyc * (children + 1);
-    // If we are ahead of the parent the transfer started a while ago for
-    // us. Make up for it, or we would run faster than the parent does.
-    if (cbl.s_live && !cbl.s_resync && late > 0)
-      cbl.s_xferleft -= MIN((u32)late, cbl.s_xferleft - cbl.s_wordcyc);
+    cbl.s_xferleft = wait + cbl.s_wordcyc * (children + 1);
+    cbl.s_gap = MAX(cbl.s_gap, wait);
+    // When the parent is done with it (used if we are the only child).
+    cbl.s_fin_pclock = ev->c + cbl.s_wordcyc * (children + 1);
+    cbl.s_fin_valid = cbl.s_local = (children == 1);
     cbl.s_inxfer = 1;
-    cbl.s_local = (children == 1);
+    cbl.s_replied = 0;
+    cbl.s_ahead = 0;
     cbl.s_pword = ev->a;
 
-    // Our word (unless it was sent ahead) follows once the game had its
-    // time to load it, see child_update.
+    // Our word follows once the game had its time to load it, see
+    // child_update.
     if (in_multi_mode())
       write_ioreg(REG_SIOCNT, siocnt | 0x0080);     // Busy
   }
@@ -564,11 +755,29 @@ static bool child_xfer(const cable_event *ev) {
 
 // Whether the game has something to do before it can be held.
 static bool child_busy(void) {
-  if (cbl.q_count || cbl.s_gap)
+  if (cbl.q_count)
     return true;
-  if (cbl.s_inxfer)
-    return cbl.s_local || !child_word_sent(cbl.s_seq);
-  return cbl.s_wrote;
+  if (cbl.s_inxfer) {
+    if (!cbl.s_replied)
+      return true;      // The parent might be waiting for our word.
+    // About to end, and the next word comes right after.
+    return cbl.s_local && cbl.s_xferleft <= cbl.s_wordcyc * 2;
+  }
+  if (cbl.s_gap)
+    return true;
+  // Getting ahead of the next transfer.
+  if (cbl.s_ahead && (s32)(cbl.s_ahead_until - cbl.s_time) > 0)
+    return true;
+  cbl.s_ahead = 0;
+  return false;
+}
+
+// The parent needs our word for the ongoing transfer.
+static void child_reply(bool force) {
+  if (cbl.s_inxfer && !cbl.s_replied && (force || !cbl.s_gap)) {
+    child_send_word();
+    cbl.s_replied = 1;
+  }
 }
 
 static bool child_update(unsigned cycles) {
@@ -576,7 +785,8 @@ static bool child_update(unsigned cycles) {
 
   cbl.s_time += cycles;
   cbl.s_gap -= MIN(cbl.s_gap, cycles);
-  cbl.s_settle -= MIN(cbl.s_settle, cycles);
+  if (cbl.s_since_fin < 0x40000000)
+    cbl.s_since_fin += cycles;
 
   cbl.poll_cycles += cycles;
   if (cbl.poll_cycles >= CBL_POLL_CYCLES) {
@@ -584,35 +794,40 @@ static bool child_update(unsigned cycles) {
     netpacket_poll_receive();
   }
 
+  child_sync();
+  child_reply(false);
+
   // With a single child both words are known, the transfer ends on time.
   if (cbl.s_inxfer && cbl.s_local) {
     if (cbl.s_xferleft > cycles)
       cbl.s_xferleft -= cycles;
     else {
-      if (!child_word_sent(cbl.s_seq))
-        child_send_word(cbl.s_seq);
-      irq = child_finish(cbl.s_pword, cbl.s_sent_word, 0xFFFF, 0xFFFF);
+      child_reply(true);
+      irq = child_finish_local();
+      // It ended a bit ago, in fact (or we would slowly get ahead).
+      cbl.s_since_fin = cycles - cbl.s_xferleft;
+
+      // The next one should come as this one did: be there by then. But
+      // not past the end of the parent frame, ours ends right after it and
+      // we must not leave before the parent does.
+      if (cbl.s_spacing <= CBL_AHEAD_MAX_CYCLES && cbl.s_live && cbl.s_pframe_valid) {
+        const u32 frame_end = cbl.s_pframe + CBL_FRAME_CYCLES;
+        cbl.s_ahead_until = cbl.s_fin_pclock + cbl.s_spacing + CBL_AHEAD_MARGIN;
+        if ((s32)(frame_end - cbl.s_time) > 0 && (s32)(frame_end - cbl.s_time) < CBL_FRAME_CYCLES) {
+          if ((s32)(cbl.s_ahead_until - frame_end) > 0)
+            cbl.s_ahead_until = frame_end;
+          cbl.s_ahead = 1;
+        }
+      }
     }
   }
 
-  if (!cbl.s_gap && !cbl.s_settle) {
-    if (cbl.s_inxfer) {
-      // The parent is waiting for our word.
-      if (!child_word_sent(cbl.s_seq))
-        child_send_word(cbl.s_seq);
-    }
-    else if (cbl.s_wrote && cbl.s_live && in_multi_mode())
-      child_send_word(cbl.s_seq + 1);   // Next word is ready, send it ahead.
-    else
-      cbl.s_wrote = 0;
-  }
+  if (cbl.s_epending)
+    child_send_early();
 
   // Do not run ahead of the parent: wait here, where we can still answer.
   while (cbl.s_live && !irq && !child_busy()) {
-    if (cbl.s_resync) {
-      cbl.s_resync = 0;
-      cbl.s_time = cbl.s_pclock;
-    }
+    child_sync();
     if ((s32)(cbl.s_pclock - cbl.s_time) > CBL_MAX_LAG_CYCLES)
       cbl.s_time = cbl.s_pclock - CBL_MAX_LAG_CYCLES;
     if ((s32)(cbl.s_time - cbl.s_pclock) <= CBL_SLACK_CYCLES)
@@ -621,7 +836,7 @@ static bool child_update(unsigned cycles) {
     if (!child_wait(CBL_CHILD_TIMEOUT_US)) {
       // Parent is not running (paused?), carry on until it shows up again.
       CBL_DEBUG_LOG("Parent clock timed out\n");
-      cbl.s_live = cbl.s_pframe_valid = 0;
+      cbl.s_live = cbl.s_pframe_valid = cbl.s_pnext_valid = 0;
     }
   }
 
@@ -633,44 +848,97 @@ static bool child_update(unsigned cycles) {
     cbl.q_head = (cbl.q_head + 1) % CBL_QUEUE_SIZE;
     cbl.q_count--;
 
-    if (ev.type == PKT_XFER)
+    if (ev.type == PKT_XFER) {
       irq = child_xfer(&ev);
-    else if (cbl.s_inxfer && !cbl.s_local && ev.seq == cbl.s_seq)
+      child_reply(false);
+    }
+    else if (cbl.s_inxfer && !cbl.s_local && ev.seq == cbl.s_seq) {
       irq = child_finish(ev.a & 0xFFFF, ev.a >> 16, ev.b & 0xFFFF, ev.b >> 16);
+      cbl.s_fin_pclock = ev.c;
+      cbl.s_fin_valid = 1;
+    }
   }
 
   return irq;
 }
 
-// A frame was emulated, we are about to return to the frontend.
-void serialcable_frame_end(void) {
+// The frontend wants a frame.
+void serialcable_frame_start(void) {
+  cbl.f_entry = netpacket_time_usec();
+  cbl.f_stayed = 0;
+}
+
+// When we expect to be running the next frame: frontends call us once per
+// frame time.
+static u64 frame_next_start(u64 now) {
+  u64 next = cbl.f_entry + CBL_FRAME_US;
+  while (next < now)
+    next += CBL_FRAME_US;
+  return next;
+}
+
+// A frame was emulated, we are about to return to the frontend. Returns true
+// if another frame should be emulated right now instead.
+bool serialcable_frame_end(void) {
+  const u64 now = netpacket_time_usec();
   s32 ahead;
 
-  if (!netpacket_active())
-    return;
+  if (!netpacket_active() || !cbl.f_entry)
+    return false;
 
   if (!ME) {
     // Children must know we will not be around for a while.
     if (cbl.m_active) {
+      // We are late if the frame took too long: no sleep for us then.
+      const u64 next = (now - cbl.f_entry < CBL_FRAME_US) ? frame_next_start(now) : now;
       cbl.m_tick = 0;
       cable_send(RETRO_NETPACKET_BROADCAST, PKT_TICK, 0,
-                 TICK_ACTIVE | TICK_FRAME_END, 0, cbl.clock);
+                 TICK_ACTIVE | TICK_FRAME_END, (u32)(next - now) + 1, cbl.clock);
     }
-    return;
+    return false;
   }
 
   if (!cbl.s_live || cbl.s_resync || !cbl.s_pframe_valid)
-    return;
+    return false;
 
   // Make our frames end right after the parent's ones: we both go to sleep
   // at the same time, instead of each one being stuck on the other's nap.
-  ahead = (s32)(cbl.s_time - cbl.s_pframe) % CBL_FRAME_CYCLES;
+  // "ahead" is how late into the parent frame ours ended. To get it earlier
+  // our game has to run that much more than the parent's one, which is done
+  // little by little: we take a step back on the parent clock, and make up
+  // for it (see the hold in child_update and the wait in child_xfer). If it
+  // ended just a bit too early, it is the other way around.
+  // (We can only get as far as the slack past the end of the parent frame
+  // while it sleeps: the target is half way there)
+  ahead = (s32)(cbl.s_time - cbl.s_pframe - CBL_SLACK_CYCLES / 2) % CBL_FRAME_CYCLES;
   if (ahead < 0)
     ahead += CBL_FRAME_CYCLES;
-  ahead -= CBL_SLACK_CYCLES / 2;
-  if (ahead > CBL_FRAME_CYCLES / 2)
-    ahead -= CBL_FRAME_CYCLES;
-  cbl.s_time -= ahead;
+  if (ahead >= CBL_FRAME_CYCLES - CBL_ALIGN_CYCLES * 2) {
+    if (ahead < CBL_FRAME_CYCLES - CBL_SLACK_CYCLES / 4)
+      cbl.s_time += CBL_FRAME_CYCLES - ahead;
+  }
+  else if (ahead > CBL_SLACK_CYCLES / 4)
+    cbl.s_time -= MIN(ahead, CBL_ALIGN_CYCLES);
+
+  // The parent is about to need us and we would not be back in time: stay.
+  if (cbl.s_pnext_valid && !cbl.f_stayed) {
+    const u64 back = frame_next_start(now);
+    // We usually get here right before the parent is done with its frame:
+    // what we know then is when it was going to start the one it is in,
+    // the next one is a frame later.
+    const bool stale = (s32)(cbl.s_pclock - cbl.s_pframe) > CBL_FRAME_CYCLES / 2;
+    const u64 pnext = cbl.s_pnext + (stale ? CBL_FRAME_US : 0);
+    // Only if it puts us ahead for good: the frame that is coming must be
+    // over before the frontend wants the one after it, or we would be late
+    // again. It should take about as long as this one did.
+    if (back > pnext + CBL_STAY_MIN_US && pnext < now + CBL_STAY_MAX_US &&
+        pnext + CBL_FRAME_US > now &&
+        back > pnext + (now - cbl.f_entry) + CBL_STAY_MARGIN_US) {
+      cbl.f_stayed = 1;
+      return true;
+    }
+  }
+  return false;
 }
 
 // How many cycles until the next cable event happens.
@@ -681,10 +949,10 @@ u32 serialcable_next_event(void) {
 
   if (cbl.s_inxfer && cbl.s_local)
     next = cbl.s_xferleft;
-  if (cbl.s_gap)
+  if (cbl.s_gap && cbl.s_inxfer && !cbl.s_replied)
     next = MIN(next, cbl.s_gap);
-  if (cbl.s_settle && cbl.s_wrote)
-    next = MIN(next, cbl.s_settle);
+  if (cbl.s_ahead && (s32)(cbl.s_ahead_until - cbl.s_time) > 0)
+    next = MIN(next, cbl.s_ahead_until - cbl.s_time);
   return next;
 }
 
@@ -749,8 +1017,8 @@ void serialcable_net_receive(const void* buf, size_t len, uint16_t client_id) {
     if (ME)
       break;
     cbl.peer[client_id].responsive = 1;
-    // Either the word for the ongoing transfer or (ahead) for the next one.
-    if ((cbl.m_busy && seq == cbl.m_seq) || seq == cbl.m_seq + 1) {
+    // The word for the ongoing transfer or (early) for the next one.
+    if (seq == cbl.m_seq || seq == cbl.m_seq + 1) {
       cbl.peer[client_id].reply[seq & 1].data = a;
       cbl.peer[client_id].reply[seq & 1].seq = seq;
       cbl.peer[client_id].reply[seq & 1].mode = b;
@@ -781,6 +1049,8 @@ void serialcable_net_receive(const void* buf, size_t len, uint16_t client_id) {
       if (a & TICK_FRAME_END) {
         cbl.s_pframe = c;
         cbl.s_pframe_valid = 1;
+        cbl.s_pnext_valid = (b != 0);
+        cbl.s_pnext = netpacket_time_usec() + (b - 1);
       }
       break;
     }
@@ -791,7 +1061,7 @@ void serialcable_net_receive(const void* buf, size_t len, uint16_t client_id) {
       CBL_DEBUG_LOG("Cable queue overflow, dropping stale transfers\n");
       cbl.q_head = cbl.q_count = 0;
       cbl.s_inxfer = 0;
-      cbl.s_sent = 0;
+      cbl.s_fin_valid = 0;
       cbl.link_dirty = 1;
       if (type == PKT_DONE)
         break;

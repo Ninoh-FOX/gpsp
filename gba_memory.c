@@ -1188,9 +1188,9 @@ cpu_alert_type function_cc write_io_register16(u32 address, u32 value)
       return write_siocnt(value);
 
     case REG_SIOMLT_SEND:
-      write_ioreg(ioreg, value);
       if (serial_mode == SERIAL_MODE_SERIAL_CABLE)
-        serialcable_send_written();
+        serialcable_send_written(read_ioreg(ioreg));
+      write_ioreg(ioreg, value);
       break;
 
     case REG_RCNT:

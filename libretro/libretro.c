@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
 
 #include <streams/file_stream.h>
 #include <compat/strl.h>
@@ -492,7 +493,14 @@ bool netpacket_active(void) {
 }
 
 // Host (wall clock) time, used to bound the waits on the network.
+// Frontends are not required to have a clock (the perf interface), so the
+// system one is used wherever there is one.
 u64 netpacket_time_usec(void) {
+#if defined(__unix__) || defined(__linux__) || defined(__APPLE__)
+  struct timespec ts;
+  if (!clock_gettime(CLOCK_MONOTONIC, &ts))
+    return (u64)ts.tv_sec * 1000000ULL + (u64)(ts.tv_nsec / 1000);
+#endif
   return (u64)perf_cb.get_time_usec();
 }
 
@@ -1408,6 +1416,7 @@ size_t retro_get_memory_size(unsigned id)
 void retro_run(void)
 {
    bool updated = false;
+   unsigned audio_frames = 1;
 
    if (cable_boot_pending)
    {
@@ -1491,21 +1500,29 @@ void retro_run(void)
       update_audio_latency = false;
    }
 
-   /* This runs just a frame */
-   #ifdef HAVE_DYNAREC
-   if (dynarec_enable)
-      execute_arm_translate(execute_cycles);
-   else
-   #endif
-   {
-      /* Sticky bits only used in interpreter */
-      clear_gamepak_stickybits();
-      execute_arm(execute_cycles);
-   }
-
-   /* Must happen before we block on the video/audio output */
    if (serial_mode == SERIAL_MODE_SERIAL_CABLE)
-      serialcable_frame_end();
+      serialcable_frame_start();
+
+   do
+   {
+      /* This runs just a frame */
+      #ifdef HAVE_DYNAREC
+      if (dynarec_enable)
+         execute_arm_translate(execute_cycles);
+      else
+      #endif
+      {
+         /* Sticky bits only used in interpreter */
+         clear_gamepak_stickybits();
+         execute_arm(execute_cycles);
+      }
+
+      /* The cable might need the next frame right now, before we block on
+       * the video/audio output: that one is then the frame to be shown. */
+      if (serial_mode != SERIAL_MODE_SERIAL_CABLE || !serialcable_frame_end())
+         break;
+      audio_frames++;
+   } while (1);
 
    if (rumble_cb) {
      // TODO: Add some user-option to select a rumble policy
@@ -1514,7 +1531,8 @@ void retro_run(void)
      rumble_cb(0, RETRO_RUMBLE_STRONG, MIN(strength, 0xffff) / 2);
    }
 
-   audio_run();
+   while (audio_frames--)
+      audio_run();
    video_run();
 
    switch (serial_mode) {

@@ -180,7 +180,7 @@ typedef enum
   REG_SIOMULTI3 = 0x93,
   REG_SIOCNT = 0x94,
   REG_SIOMLT_SEND = 0x95,
-  REG_SIODATA8 = 0x96,
+  REG_SIODATA8 = 0x95,
   // Key input
   REG_P1 = 0x098,
   REG_P1CNT = 0x099,

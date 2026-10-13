@@ -392,6 +392,10 @@ bool main_read_savestate(const u8 *src)
       serial_set_irq_cycles(0);   /* Older states: no pending IRQ. */
   }
 
+  /* The other consoles did not travel back in time with us: whatever
+   * transfer was going on is lost, the cable stays plugged. */
+  serialcable_reset();
+
   /* random_state is also optional for backwards compat. Missing means
    * 'use whatever is currently in the static'; the RFU path will reseed
    * from cpu_ticks on the next rfu_reset, which is also deterministic. */
