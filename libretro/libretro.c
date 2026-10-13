@@ -1503,6 +1503,10 @@ void retro_run(void)
       execute_arm(execute_cycles);
    }
 
+   /* Must happen before we block on the video/audio output */
+   if (serial_mode == SERIAL_MODE_SERIAL_CABLE)
+      serialcable_frame_end();
+
    if (rumble_cb) {
      // TODO: Add some user-option to select a rumble policy
      u32 strength = 0xffff * rumble_active_pct();
