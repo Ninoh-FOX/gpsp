@@ -83,6 +83,12 @@ unsigned sound_timer(fixed8_24 frequency_step, u32 channel)
     sample_status = ds->status;
   }
 
+#ifdef GPSP_INSTANCE_B
+  // Dual Cable Link: nobody hears this GBA. Its samples are not made; the
+  // FIFO and its DMA, which the game sees, go on as always.
+  sample_status = DIRECT_SOUND_INACTIVE;
+#endif
+
   // Unqueue 1 sample from the base of the DS FIFO and place it on the audio
   // buffer for as many samples as necessary. If the DS FIFO is 16 bytes or
   // smaller and if DMA is enabled for the sound channel initiate a DMA transfer
@@ -330,6 +336,17 @@ u32 gbc_sound_master_volume;
  * keep 4 of them by accumulating at 16-bit scale, rounding to nearest.
  * Overflow-safe in s32: the product spans [-2^31, 7 * 2^28] and adding the
  * half-LSB 2^17 cannot exceed INT32_MAX nor underflow INT32_MIN. */
+#ifdef GPSP_INSTANCE_B
+/* Dual Cable Link: nobody hears this GBA. Only the samples are left out:
+ * the length, envelope and sweep counters (the status bits the game reads)
+ * go on as always. */
+#define gbc_sound_render_sample_right()                                       \
+  (void)current_sample                                                        \
+
+#define gbc_sound_render_sample_left()                                        \
+  (void)current_sample                                                        \
+
+#else
 #define gbc_sound_render_sample_right()                                       \
   sound_buffer[buffer_index + 1] +=                                           \
    (current_sample * volume_right + (1 << 17)) >> 18                          \
@@ -337,6 +354,8 @@ u32 gbc_sound_master_volume;
 #define gbc_sound_render_sample_left()                                        \
   sound_buffer[buffer_index] +=                                               \
    (current_sample * volume_left + (1 << 17)) >> 18                           \
+
+#endif
 
 #define gbc_sound_render_sample_both()                                        \
   gbc_sound_render_sample_right();                                            \

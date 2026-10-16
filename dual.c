@@ -26,8 +26,10 @@
 //     HELLO (ROM, BIOS, settings) <---->  HELLO
 //     PING/PONG (round trip time)
 //     STATE + SRAM of its own GBA <---->  STATE + SRAM of its own GBA
+//       (run length coded: after the restart it is mostly empty)
 //     READY (input delay)         <---->  READY
-//     INPUT (frame, buttons)      <---->  INPUT, every frame
+//     INPUT (frame, buttons,      <---->  INPUT, every frame
+//            how far ahead it is)
 //     HASH (both GBAs, sometimes) <---->  HASH: both copies must agree
 //
 // Both games are restarted when the cable is plugged in (games only look for
@@ -39,6 +41,10 @@
 // runs frame N with the same buttons on both GBAs: both consoles compute the
 // same two machines. A console that does not have the other's buttons yet
 // shows the last frame again and tries later.
+//
+// Both consoles also show frame N at the same time, so that both screens
+// (and both speakers) go together: each one tells the other how far ahead
+// it thinks it is, and the one that is ahead waits a frame now and then.
 
 #include <pthread.h>
 #include <semaphore.h>
@@ -68,6 +74,7 @@ void *gbab_retro_get_memory_data(unsigned);
 void gbab_dualport_begin(unsigned slot);
 void gbab_dualport_end(void);
 void gbab_dualport_set_keys(uint32_t keys);
+void gbab_reset_gba(void);
 void gbab_rtc_dual_begin(bool owner);
 void gbab_rtc_dual_end(void);
 extern int gbab_serial_mode;
@@ -79,20 +86,22 @@ extern u32 gbab_reg[];
 /* ---- protocol ------------------------------------------------------------- */
 
 #define DUAL_HEADER        0x4d434431   // MCD1 (Multiplayer Cable, Dual)
-#define DUAL_VERSION       1
+#define DUAL_VERSION       3
 
 #define DPK_HELLO          1   // version, rom crc, bios crc, settings, host
 #define DPK_PING           2   // time
 #define DPK_PONG           3   // time (echoed)
-#define DPK_STATE          4   // offset, total size, data
+#define DPK_STATE          4   // offset, total (coded) size, data
 #define DPK_READY          5   // input delay (host)
-#define DPK_INPUT          6   // frame, buttons
+#define DPK_INPUT          6   // frame, buttons, current frame, lead (us),
+                               // times we waited for the peer's buttons
 #define DPK_HASH           7   // frame, hash slot 0, hash slot 1
 #define DPK_BYE            8   // reason
 
 #define DUAL_CHUNK         (16 * 1024)
 #define DUAL_SRAM_SIZE     (1024 * 128)
 #define DUAL_BLOB_SIZE     (GBA_STATE_MEM_SIZE + DUAL_SRAM_SIZE)
+#define DUAL_PACK_MAX      (DUAL_BLOB_SIZE + DUAL_BLOB_SIZE / 128 + 16)
 #define DUAL_RING          256         // Frames of buttons kept
 #define DUAL_HASH_EVERY    120         // Frames between agreement checks
 #define DUAL_HASH_SLOTS    4
@@ -102,8 +111,17 @@ extern u32 gbab_reg[];
 #define DUAL_PEER_US       15000000    // Peer silent while playing: it is gone
 #define DUAL_STALL_US      12000       // Longest wait for buttons in a frame
 #define DUAL_FRAME_US      16743
-#define DUAL_PINGS         4           // Round trips measured before the states
-#define DUAL_PING_US       1500000     // ...for at most this long
+#define DUAL_KEY_RESET     0x80000000  // With the buttons: both games restart
+#define DUAL_PINGS         8           // Round trips measured before the states
+#define DUAL_PING_US       1000000     // ...for at most this long
+#define DUAL_PONG_US       200000      // A ping with no answer: send another
+#define DUAL_SLICE_US      10000       // Setup work per frame (it waits anyway)
+#define DUAL_SYNC_WIN      16          // Packets the peer's position comes from
+#define DUAL_SYNC_US       (DUAL_FRAME_US * 5 / 8)   // Ahead by more: wait
+#define DUAL_SYNC_GAP      60          // Frames between two waits
+#define DUAL_DELAY_MORE    4           // Most frames added to the input delay
+#define DUAL_DELAY_CALM_US 60000000    // Peer happy this long: one frame less
+#define DUAL_DELAY_CALM_MAX 600000000  // (twice as long each time that was wrong)
 
 enum { DS_OFF = 0, DS_HELLO, DS_PING, DS_TRANSFER, DS_READY, DS_RUN };
 
@@ -133,12 +151,24 @@ static struct {
   bool hello_sent, hello_rcvd;
   u64 t_hello;                  // Last HELLO sent
   u32 peer_hello[6];
-  u32 rtt_us, rtt_samples;
+  u32 rtt[DUAL_PINGS], rtt_samples;
+  bool ping_out;                // A ping is on its way
+  u64 t_ping;
   bool peer_ready;
-  u32 delay;                    // Input delay, frames
+  u32 delay;                    // Input delay, frames (agreed at the start)
+  u32 send_delay;               // Ours now: more after the peer waited
+  u32 stalls;                   // Frames we waited for the peer's buttons
+  u32 stall_frame;              // (the last one counted, + 1)
+  u32 peer_stalls;              // ...and the peer for ours
+  u64 t_peer_stall;             // When the peer last waited for us
+  u64 t_lowered;                // When we last took a frame off
+  u64 calm_us;                  // How long it must be calm for that
+  bool reset_wanted;            // The player asked for a reset
 
   u8 *own_blob, *peer_blob;
-  u32 peer_rcvd;
+  u8 *own_pack, *peer_pack;     // The same, run length coded
+  u32 own_pack_len;
+  u32 peer_pack_len, peer_rcvd;
   bool own_sent;
   bool loaded;
 
@@ -150,6 +180,13 @@ static struct {
   // Agreement checks: [frame + 1, slot 0 GBA, slot 1 GBA], ours and theirs
   u32 my_hash[DUAL_HASH_SLOTS][3];
   u32 peer_hash[DUAL_HASH_SLOTS][3];
+
+  // Time sync. Where the peer is: from each INPUT, the peer's frame (in us)
+  // at our time 0; the best of the last ones is the least late.
+  s64 peer_pos[DUAL_SYNC_WIN];
+  u32 peer_pos_n;
+  s32 peer_lead;                // How far ahead the peer says it is (us)
+  u32 sync_next;                // No waiting before this frame
 } ds;
 
 void netpacket_send(uint16_t client_id, const void *buf, size_t len);
@@ -496,7 +533,59 @@ static u32 hash_b(void) {
 static void dual_free_blobs(void) {
   free(ds.own_blob);
   free(ds.peer_blob);
-  ds.own_blob = ds.peer_blob = NULL;
+  free(ds.own_pack);
+  free(ds.peer_pack);
+  ds.own_blob = ds.peer_blob = ds.own_pack = ds.peer_pack = NULL;
+}
+
+// Run length coding for the states sent at the start: after the restart
+// they are mostly zeros (and save memory mostly FF). A control byte c < 80
+// is followed by c + 1 bytes as they are; otherwise the next byte is there
+// (c & 7F) + 3 times.
+static u32 rle_pack(u8 *dst, const u8 *src, u32 len) {
+  u32 i = 0, lit = 0, o = 0;
+  while (i <= len) {
+    u32 run = 0;
+    if (i < len)
+      for (run = 1; i + run < len && run < 130 && src[i + run] == src[i]; run++);
+    if (i == len || run >= 3) {
+      while (lit < i) {
+        const u32 n = MIN(128, i - lit);
+        dst[o++] = n - 1;
+        memcpy(&dst[o], &src[lit], n);
+        o += n;
+        lit += n;
+      }
+      if (i == len)
+        break;
+      dst[o++] = 0x80 | (run - 3);
+      dst[o++] = src[i];
+      lit = i + run;
+    }
+    i += run;
+  }
+  return o;
+}
+
+static bool rle_unpack(u8 *dst, u32 len, const u8 *src, u32 slen) {
+  u32 i = 0, o = 0;
+  while (i < slen) {
+    const u32 c = src[i++];
+    if (c < 0x80) {
+      if (i + c + 1 > slen || o + c + 1 > len)
+        return false;
+      memcpy(&dst[o], &src[i], c + 1);
+      i += c + 1;
+      o += c + 1;
+    }
+    else {
+      if (i >= slen || o + (c & 0x7F) + 3 > len)
+        return false;
+      memset(&dst[o], src[i++], (c & 0x7F) + 3);
+      o += (c & 0x7F) + 3;
+    }
+  }
+  return o == len;
 }
 
 // Back to a single GBA: the player's one goes on, unplugged.
@@ -521,19 +610,46 @@ static void dual_stop(const char *why) {
   (void)was_running;
 }
 
+// One 32 KB block of the ROM. The RTC/rumble registers (C4-C9) are written
+// into the first block while the game runs: they are left out.
+static u32 rom_hash_block(u32 h, const u8 *data, u32 idx) {
+  static u32 blk[32 * 1024 / 4];
+  u32 i;
+  memcpy(blk, data, sizeof(blk));
+  if (!idx)
+    memset((u8*)blk + 0xC4, 0, 6);
+  for (i = 0; i < 32 * 1024 / 4; i++) {
+    h = (h ^ blk[i]) * 0x01000193u;
+    h = (h << 5) | (h >> 27);
+  }
+  return h;
+}
+
+// Which game this is. It is in memory already unless the ROM is too big for
+// it (then it is read from the file, same result): reading the file again is
+// slow on a SD card, and the players wait for it.
 static u32 dual_rom_crc(void) {
+  extern u8 *gamepak_buffers[32];
+  extern u32 gamepak_file_blocks;
   if (!ds.rom_crc_valid) {
-    RFILE *f = filestream_open(ds.rom_path, RETRO_VFS_FILE_ACCESS_READ,
-                               RETRO_VFS_FILE_ACCESS_HINT_NONE);
-    u32 crc = 0;
-    if (f) {
-      static u8 buf[64 * 1024];
-      int64_t n;
-      while ((n = filestream_read(f, buf, sizeof(buf))) > 0)
-        crc = dual_crc32(crc, buf, (size_t)n);
-      filestream_close(f);
+    u32 h = 0x811C9DC5u ^ gamepak_file_blocks, b;
+    if (!gamepak_must_swap() && !gamepak_mini_materialized &&
+        gamepak_file_blocks <= gamepak_buffer_count * 32) {
+      for (b = 0; b < gamepak_file_blocks; b++)
+        h = rom_hash_block(h, &gamepak_buffers[b >> 5][(b & 31) << 15], b);
     }
-    ds.rom_crc = crc;
+    else {
+      RFILE *f = filestream_open(ds.rom_path, RETRO_VFS_FILE_ACCESS_READ,
+                                 RETRO_VFS_FILE_ACCESS_HINT_NONE);
+      static u8 buf[32 * 1024];
+      if (f) {
+        for (b = 0; b < gamepak_file_blocks &&
+                    filestream_read(f, buf, sizeof(buf)) == sizeof(buf); b++)
+          h = rom_hash_block(h, buf, b);
+        filestream_close(f);
+      }
+    }
+    ds.rom_crc = h;
     ds.rom_crc_valid = true;
   }
   return ds.rom_crc;
@@ -558,6 +674,8 @@ static void dual_send_ping(void) {
   w[0] = (u32)now;
   w[1] = (u32)(now >> 32);
   dual_send(DPK_PING, w, 2, NULL, 0);
+  ds.ping_out = true;
+  ds.t_ping = now;
 }
 
 static bool dual_hello_matches(void) {
@@ -572,9 +690,8 @@ static bool dual_hello_matches(void) {
 // sent to the other console. The game starts over first.
 static bool dual_capture(void) {
   ds.own_blob = (u8*)malloc(DUAL_BLOB_SIZE);
-  if (!ds.peer_blob)
-    ds.peer_blob = (u8*)malloc(DUAL_BLOB_SIZE);
-  if (!ds.own_blob || !ds.peer_blob)
+  ds.own_pack = (u8*)malloc(DUAL_PACK_MAX);
+  if (!ds.own_blob || !ds.own_pack)
     return false;
 
   reset_gba();
@@ -582,17 +699,20 @@ static bool dual_capture(void) {
   memset(ds.own_blob, 0, GBA_STATE_MEM_SIZE);
   gba_save_state(ds.own_blob);
   memcpy(&ds.own_blob[GBA_STATE_MEM_SIZE], gamepak_backup, DUAL_SRAM_SIZE);
+  ds.own_pack_len = rle_pack(ds.own_pack, ds.own_blob, DUAL_BLOB_SIZE);
   ds.own_sent = false;
   return true;
 }
 
 static void dual_send_blob(void) {
   u32 off;
-  for (off = 0; off < DUAL_BLOB_SIZE; off += DUAL_CHUNK) {
-    u32 w[2] = { off, DUAL_BLOB_SIZE };
-    u32 len = MIN(DUAL_CHUNK, DUAL_BLOB_SIZE - off);
-    dual_send(DPK_STATE, w, 2, &ds.own_blob[off], len);
+  for (off = 0; off < ds.own_pack_len; off += DUAL_CHUNK) {
+    u32 w[2] = { off, ds.own_pack_len };
+    u32 len = MIN(DUAL_CHUNK, ds.own_pack_len - off);
+    dual_send(DPK_STATE, w, 2, &ds.own_pack[off], len);
   }
+  free(ds.own_pack);
+  ds.own_pack = NULL;
   ds.own_sent = true;
 }
 
@@ -627,8 +747,11 @@ static bool dual_load_machines(void) {
 // is done before anything is sent.
 static void dual_session_reset(void) {
   dual_free_blobs();
-  ds.peer_rcvd = 0;
-  ds.rtt_us = ds.rtt_samples = 0;
+  ds.peer_rcvd = ds.peer_pack_len = 0;
+  ds.rtt_samples = 0;
+  ds.ping_out = false;
+  ds.peer_pos_n = 0;
+  ds.peer_lead = 0;
   ds.hello_sent = ds.hello_rcvd = ds.peer_ready = false;
   memset(ds.peer_keys, 0, sizeof(ds.peer_keys));
   memset(ds.peer_frame_ok, 0, sizeof(ds.peer_frame_ok));
@@ -648,6 +771,13 @@ static void dual_start_running(void) {
     ds.peer_frame_ok[i] = i + 1;
   }
   ds.sent_upto = ds.delay;
+  ds.send_delay = ds.delay;
+  ds.stalls = ds.stall_frame = ds.peer_stalls = 0;
+  ds.t_peer_stall = netpacket_time_usec();
+  ds.t_lowered = 0;
+  ds.calm_us = DUAL_DELAY_CALM_US;
+  ds.sync_next = DUAL_SYNC_GAP;
+  ds.reset_wanted = false;
   ds.t_heard = netpacket_time_usec();
   {
     char msg[96];
@@ -657,14 +787,23 @@ static void dual_start_running(void) {
   }
 }
 
+static u32 dual_rtt_min(void) {
+  u32 i, m = ~0U;
+  for (i = 0; i < MIN(ds.rtt_samples, DUAL_PINGS); i++)
+    m = MIN(m, ds.rtt[i]);
+  return ds.rtt_samples ? m : 0;
+}
+
 // Input delay from the round trip: the buttons must get to the other console
-// before it needs them. The two consoles are up to a frame apart, and a frame
-// more covers the network having a bad moment.
+// before it needs them. The time sync keeps the two consoles within
+// DUAL_SYNC_US of each other; on top of that the network takes one way, and
+// a frame more covers it having a bad moment.
 static u32 dual_pick_delay(void) {
   u32 d;
   if (!ds.rtt_samples)
     return 4;
-  d = (ds.rtt_us / 2 + DUAL_FRAME_US + DUAL_FRAME_US - 1) / DUAL_FRAME_US + 1;
+  d = (dual_rtt_min() / 2 + DUAL_SYNC_US + DUAL_FRAME_US + DUAL_FRAME_US - 1) /
+      DUAL_FRAME_US;
   return MAX(2, MIN(d, 30));
 }
 
@@ -694,6 +833,7 @@ static void dual_setup_step(void) {
       ds.state = DS_PING;
       ds.t_state = now;
       dual_send_ping();
+      return;
     }
     else if (now - ds.t_state > DUAL_HELLO_US) {
       // The other console does not have this core: real time cable. Tell it,
@@ -705,6 +845,7 @@ static void dual_setup_step(void) {
   }
 
   if (ds.state == DS_PING) {
+    // One at a time, so that each one has the network to itself.
     if (ds.rtt_samples >= DUAL_PINGS || now - ds.t_state > DUAL_PING_US) {
       if (!dual_capture()) {
         dual_stop("Cable Link: not enough memory for the second GBA");
@@ -714,14 +855,17 @@ static void dual_setup_step(void) {
       ds.state = DS_TRANSFER;
       dual_send_blob();
     }
-    else
+    else if (!ds.ping_out || now - ds.t_ping > DUAL_PONG_US)
       dual_send_ping();
     return;
   }
 
   if (ds.state == DS_TRANSFER) {
-    if (ds.peer_rcvd >= DUAL_BLOB_SIZE) {
-      if (!dual_load_machines()) {
+    if (ds.peer_pack_len && ds.peer_rcvd >= ds.peer_pack_len) {
+      ds.peer_blob = (u8*)malloc(DUAL_BLOB_SIZE);
+      if (!ds.peer_blob ||
+          !rle_unpack(ds.peer_blob, DUAL_BLOB_SIZE, ds.peer_pack, ds.peer_pack_len) ||
+          !dual_load_machines()) {
         dual_send(DPK_BYE, NULL, 0, NULL, 0);
         dual_stop("Cable Link: could not start the second GBA");
         return;
@@ -769,6 +913,9 @@ void dual_game_loaded(const char *path, u32 cfg) {
 }
 
 // A netplay session started (Cable Link mode). The host waits for a client.
+// The slow part of the setup (which game this is, the second GBA) is done
+// now: the host does it while it waits, the client while its HELLO is on
+// the way.
 void dual_session_start(unsigned client_id) {
   dual_stop(NULL);
   ds.is_host = (client_id == 0);
@@ -776,6 +923,10 @@ void dual_session_start(unsigned client_id) {
   ds.peer_id = ds.is_host ? -1 : 0;
   dual_session_reset();
   ds.state = ds.is_host ? DS_OFF : DS_HELLO;
+  if (!ds.is_host)
+    dual_send_hello();
+  dual_rom_crc();
+  b_load();     // (if it fails, HELLO says so)
 }
 
 // Host: a client joined. Only one other console can be on a dual cable.
@@ -803,9 +954,18 @@ void dual_session_stop(void) {
 }
 
 // Whether the dual cable is setting up (true: do not run the game now).
+// The game is stopped anyway: rather than one step per frame, go on for most
+// of the frame, as soon as the other console answers.
 bool dual_setting_up(void) {
-  if (ds.state != DS_OFF && ds.state != DS_RUN)
+  const u64 t0 = netpacket_time_usec();
+  while (ds.state != DS_OFF && ds.state != DS_RUN) {
     dual_setup_step();
+    if (ds.state == DS_OFF || ds.state == DS_RUN ||
+        netpacket_time_usec() - t0 > DUAL_SLICE_US)
+      break;
+    netpacket_poll_receive();
+    usleep(250);
+  }
   return ds.state != DS_OFF && ds.state != DS_RUN;
 }
 
@@ -813,20 +973,64 @@ bool dual_running(void) {
   return ds.state == DS_RUN;
 }
 
-// The buttons for this frame. Returns false if the other console's are not
-// here yet: the frame is not run now.
-bool dual_frame_begin(u32 local_keys) {
+// The player pressed reset: it goes with the next buttons sent.
+void dual_request_reset(void) {
+  if (ds.state == DS_RUN)
+    ds.reset_wanted = true;
+}
+
+// How far ahead of the other console we are (us, at `now`): where we are
+// (the frame about to start) against where it is (the frame it was starting
+// when it sent its last buttons, plus the time since).
+static s32 dual_lead(u64 now) {
+  s64 best;
+  u32 i;
+  if (!ds.peer_pos_n)
+    return 0;
+  best = ds.peer_pos[0];
+  for (i = 1; i < MIN(ds.peer_pos_n, DUAL_SYNC_WIN); i++)
+    best = MAX(best, ds.peer_pos[i]);
+  return (s32)((s64)ds.frame * DUAL_FRAME_US - (s64)now - best);
+}
+
+// The buttons for this frame. Returns DUAL_FRAME_WAIT if the other console's
+// are not here yet, DUAL_FRAME_HOLD if we are ahead of it: the frame is not
+// run now.
+int dual_frame_begin(u32 local_keys) {
   const u32 f = ds.frame;
   const u32 fi = f % DUAL_RING;
   const u64 t0 = netpacket_time_usec();
+  const s32 lead = dual_lead(t0);
 
-  // Ours for frame f + delay.
-  while (ds.sent_upto <= f + ds.delay) {
-    u32 w[2];
+  // Ahead of the other console (both work it out the same way, so only one
+  // of them can be): stay a frame where we are. Never so often that the
+  // other one cannot see it before the next time.
+  if (f >= ds.sync_next && ds.peer_pos_n >= DUAL_SYNC_WIN &&
+      (lead - ds.peer_lead) / 2 > DUAL_SYNC_US) {
+    ds.sync_next = f + DUAL_SYNC_GAP;
+    return DUAL_FRAME_HOLD;
+  }
+
+  // The network had a bad moment and the peer waited for our buttons: they
+  // go out earlier (each console sends its own buttons for whatever frame
+  // it likes, so this needs no agreement). Back down once all is calm.
+  if (ds.send_delay > ds.delay && t0 - ds.t_peer_stall > ds.calm_us) {
+    ds.send_delay--;
+    ds.t_peer_stall = ds.t_lowered = t0;
+  }
+
+  // Ours for frame f + delay. (With a shorter delay than last time, nothing
+  // goes out until it catches up: those frames have their buttons already.)
+  while (ds.sent_upto <= f + ds.send_delay) {
+    u32 w[5];
     w[0] = ds.sent_upto;
-    w[1] = local_keys;
-    ds.own_keys[ds.sent_upto % DUAL_RING] = local_keys;
-    dual_send(DPK_INPUT, w, 2, NULL, 0);
+    w[1] = local_keys | (ds.reset_wanted ? DUAL_KEY_RESET : 0);
+    ds.reset_wanted = false;
+    w[2] = f;
+    w[3] = (u32)lead;
+    w[4] = ds.stalls;
+    ds.own_keys[ds.sent_upto % DUAL_RING] = w[1];
+    dual_send(DPK_INPUT, w, 5, NULL, 0);
     ds.sent_upto++;
   }
 
@@ -834,27 +1038,42 @@ bool dual_frame_begin(u32 local_keys) {
   while (ds.peer_frame_ok[fi] != f + 1) {
     const u64 now = netpacket_time_usec();
     if (ds.state != DS_RUN)
-      return false;
+      return DUAL_FRAME_WAIT;
     if (now - ds.t_heard > DUAL_PEER_US) {
       dual_send(DPK_BYE, NULL, 0, NULL, 0);
       dual_stop("Cable Link: the other console stopped answering");
-      return false;
+      return DUAL_FRAME_WAIT;
     }
-    if (now - t0 > DUAL_STALL_US)
-      return false;
+    if (now - t0 > DUAL_STALL_US) {
+      if (ds.stall_frame != f + 1) {
+        ds.stall_frame = f + 1;
+        ds.stalls++;
+      }
+      return DUAL_FRAME_WAIT;
+    }
     netpacket_poll_receive();
     if (ds.peer_frame_ok[fi] != f + 1)
       usleep(250);
   }
 
-  dualport_set_keys(ds.own_keys[fi]);
-  gbab_dualport_set_keys(ds.peer_keys[fi]);
+  // A player pressed reset: both consoles restart both games in this very
+  // frame, with the cable plugged again (as at the start of the session).
+  if ((ds.own_keys[fi] | ds.peer_keys[fi]) & DUAL_KEY_RESET) {
+    reset_gba();
+    gbab_reset_gba();
+    bus_reset();
+    dualport_begin(ds.my_slot);
+    gbab_dualport_begin(ds.my_slot ^ 1);
+  }
+
+  dualport_set_keys(ds.own_keys[fi] & ~DUAL_KEY_RESET);
+  gbab_dualport_set_keys(ds.peer_keys[fi] & ~DUAL_KEY_RESET);
 #ifdef DUAL_DEBUG
   // Test of the agreement check: the hidden GBA gets other buttons once.
   if (getenv("DUAL_FAULT") && f == 300)
     gbab_dualport_set_keys(ds.peer_keys[fi] ^ 0x1);
 #endif
-  return true;
+  return DUAL_FRAME_RUN;
 }
 
 void dual_b_frame_start(void) {
@@ -929,25 +1148,22 @@ bool dual_net_receive(const void *buf, size_t len, uint16_t client_id) {
   case DPK_PONG:
     if (len >= 16) {
       const u64 t = netorder32(pkt[2]) | ((u64)netorder32(pkt[3]) << 32);
-      const u32 rtt = (u32)(netpacket_time_usec() - t);
-      // The best one: the others waited behind something else.
-      ds.rtt_us = ds.rtt_samples ? MIN(ds.rtt_us, rtt) : rtt;
+      ds.rtt[ds.rtt_samples % DUAL_PINGS] = (u32)(netpacket_time_usec() - t);
       ds.rtt_samples++;
+      ds.ping_out = false;
     }
     break;
 
   case DPK_STATE:
     if (len > 16 && ds.state >= DS_HELLO && ds.state <= DS_TRANSFER) {
-      if (!ds.peer_blob)
-        ds.peer_blob = (u8*)malloc(DUAL_BLOB_SIZE);
-      if (!ds.peer_blob)
-        break;
-    }
-    if (len > 16 && ds.peer_blob && ds.state >= DS_HELLO && ds.state <= DS_TRANSFER) {
       const u32 off = netorder32(pkt[2]);
+      const u32 total = netorder32(pkt[3]);
       const u32 dlen = len - 16;
-      if (off + dlen <= DUAL_BLOB_SIZE) {
-        memcpy(&ds.peer_blob[off], &pkt[4], dlen);
+      if (!ds.peer_pack)
+        ds.peer_pack = (u8*)malloc(DUAL_PACK_MAX);
+      if (ds.peer_pack && total <= DUAL_PACK_MAX && off + dlen <= total) {
+        memcpy(&ds.peer_pack[off], &pkt[4], dlen);
+        ds.peer_pack_len = total;
         ds.peer_rcvd += dlen;
       }
     }
@@ -961,10 +1177,24 @@ bool dual_net_receive(const void *buf, size_t len, uint16_t client_id) {
     break;
 
   case DPK_INPUT:
-    if (len >= 16 && ds.state != DS_OFF) {
+    if (len >= 28 && ds.state != DS_OFF) {
       const u32 f = netorder32(pkt[2]);
       ds.peer_keys[f % DUAL_RING] = netorder32(pkt[3]);
       ds.peer_frame_ok[f % DUAL_RING] = f + 1;
+      // The peer was starting this frame one way ago.
+      ds.peer_pos[ds.peer_pos_n++ % DUAL_SYNC_WIN] =
+        (s64)netorder32(pkt[4]) * DUAL_FRAME_US + dual_rtt_min() / 2 -
+        (s64)ds.t_heard;
+      ds.peer_lead = (s32)netorder32(pkt[5]);
+      if (netorder32(pkt[6]) != ds.peer_stalls && ds.state == DS_RUN) {
+        ds.peer_stalls = netorder32(pkt[6]);
+        ds.send_delay = MIN(ds.send_delay + 1,
+                            MIN(ds.delay + DUAL_DELAY_MORE, DUAL_RING / 2));
+        // Taking that frame off was too soon: next time, wait longer.
+        if (ds.t_lowered && ds.t_heard - ds.t_lowered < ds.calm_us)
+          ds.calm_us = MIN(ds.calm_us * 2, DUAL_DELAY_CALM_MAX);
+        ds.t_peer_stall = ds.t_heard;
+      }
     }
     break;
 

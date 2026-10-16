@@ -16,7 +16,7 @@ linktest.gba: crt0.S linktest.c rom.ld
 	rm -f crt0.o linktest.o linktest.elf
 
 dualtest: dualtest.c
-	$(TC)-gcc -O2 -Wall -I../../libretro/libretro-common/include -o $@ $< -ldl
+	$(TC)-gcc -O2 -Wall -I../../libretro/libretro-common/include -o $@ $< -ldl -lpthread
 
 clean:
 	rm -f linktest.gba dualtest crt0.o linktest.o linktest.elf

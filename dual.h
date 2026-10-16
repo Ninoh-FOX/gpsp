@@ -80,7 +80,11 @@ void dual_session_stop(void);
 bool dual_net_receive(const void *buf, size_t len, uint16_t client_id);
 bool dual_setting_up(void);
 bool dual_running(void);
-bool dual_frame_begin(uint32_t local_keys);
+void dual_request_reset(void);
+// dual_frame_begin: run the frame now, or not (waiting for the other
+// console's buttons, or a frame held back to keep both consoles together).
+enum { DUAL_FRAME_WAIT = 0, DUAL_FRAME_RUN, DUAL_FRAME_HOLD };
+int dual_frame_begin(uint32_t local_keys);
 void dual_b_frame_start(void);
 void dual_b_frame_wait(void);
 void dual_frame_end(void);

@@ -422,6 +422,11 @@ static void audio_run(void)
    if (!audio_sample_buffer)
       return;
 
+#ifdef GPSP_INSTANCE_B
+   /* Dual Cable Link: nobody hears this GBA (it makes no samples). */
+   return;
+#endif
+
    /* audio_samples_per_frame is decimal;
     * get integer component */
    samples_to_read = (u32)audio_samples_per_frame;
@@ -454,6 +459,23 @@ static void audio_run(void)
       audio_buffer_ptr += samples_to_write << 1;
    }
 }
+
+#ifndef GPSP_INSTANCE_B
+/* A frame of silence: a frame held back by the Dual Cable Link takes as long
+ * as any other one (with audio sync, a frame with no sound takes no time). */
+static void audio_silence_run(void)
+{
+   static const s16 zeros[AUDIO_BATCH_FRAMES_MAX * 2];
+   u32 samples = (u32)audio_samples_per_frame;
+
+   while (samples > 0)
+   {
+      u32 samples_to_write = MIN(samples, AUDIO_BATCH_FRAMES_MAX);
+      audio_batch_cb(zeros, samples_to_write);
+      samples -= samples_to_write;
+   }
+}
+#endif
 
 static void video_run(void)
 {
@@ -926,7 +948,11 @@ void retro_reset(void)
 {
 #ifndef GPSP_INSTANCE_B
    if (serial_mode == SERIAL_MODE_DUAL_CABLE)
-      return;     // Same as a state load: the other console has a copy
+   {
+      // The other console has a copy of this GBA: both restart together.
+      dual_request_reset();
+      return;
+   }
 #endif
    reset_gba();
 }
@@ -1563,8 +1589,16 @@ static void retro_run_dual(void)
    bool updated = false;
 
    input_poll_cb();
-   if (!dual_frame_begin(input_local_keys()))
+   switch (dual_frame_begin(input_local_keys()))
    {
+   case DUAL_FRAME_RUN:
+      break;
+   case DUAL_FRAME_HOLD:
+      /* Ahead of the other console: this frame waits. */
+      audio_silence_run();
+      video_cb(NULL, GBA_SCREEN_WIDTH, GBA_SCREEN_HEIGHT, GBA_SCREEN_PITCH * 2);
+      return;
+   default:
       /* The other console's buttons for this frame are not here yet. */
       video_cb(NULL, GBA_SCREEN_WIDTH, GBA_SCREEN_HEIGHT, GBA_SCREEN_PITCH * 2);
       return;
