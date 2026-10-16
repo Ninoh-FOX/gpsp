@@ -194,5 +194,6 @@ typedef u32 fixed8_24;
 #include "main.h"
 #include "cheats.h"
 #include "serial.h"
+#include "dual.h"
 
 #endif

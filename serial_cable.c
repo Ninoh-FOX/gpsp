@@ -51,8 +51,10 @@
 // goes back to waiting for the transfers, for the rest of the session.
 // Games that load their words in any other way never get to use this.
 //
-// Normal (8/32 bit) mode is a plain XFER/REPLY swap between the parent and
-// player 2.
+// Normal (8/32 bit) mode goes one way only on a GBA cable: the SI pin of the
+// parent end is grounded, so the parent always receives zero, and only the
+// second console gets the parent's bits. The parent never needs an answer:
+// it sends XFER and finishes the transfer on time, no round trip.
 //
 // Both consoles must also advance at the same pace. Emulators run a frame
 // in a burst and then sleep in the frontend, where they cannot answer. A
@@ -95,6 +97,9 @@
 // transmitting.
 
 #include "common.h"
+#if defined(__unix__) || defined(__linux__) || defined(__APPLE__)
+  #include <sched.h>
+#endif
 
 // Debug print logic:
 //#define SERIALCABLE_DEBUG 1
@@ -109,11 +114,11 @@ void netpacket_poll_receive();
 bool netpacket_active(void);
 u64 netpacket_time_usec(void);
 
-#define NET_CABLE_HEADER       0x4d434235   // MCB5 (Multiplayer CaBle, v5)
+#define NET_CABLE_HEADER       0x4d434236   // MCB6 (Multiplayer CaBle, v6)
 
 #define PKT_STATUS             1    // a: status flags
 #define PKT_XFER               2    // a: data, b: transfer config, c: parent clock
-#define PKT_REPLY              3    // a: data, b: transfer mode
+#define PKT_REPLY              3    // a: data, b: transfer mode (multiplayer only)
 #define PKT_DONE               4    // a: words 0/1, b: words 2/3, c: parent clock
 #define PKT_TICK               5    // a: tick flags, b: time to next frame, c: parent clock
 
@@ -189,6 +194,7 @@ static struct {
   } peer[4];
 
   u8 status_sent;                // Last status we reported
+  u8 so_out;                     // Normal mode SO level (latched during transfers)
   u8 link_dirty;                 // Line levels might have changed
   u32 clock;                     // Emulated time
   u32 poll_cycles;
@@ -280,7 +286,7 @@ static u8 own_status(void) {
     if (!ME && parent_all_ready())
       flags |= ST_ALLREADY;
   }
-  else if (in_normal_mode() && (read_ioreg(REG_SIOCNT) & 0x0008))
+  else if (in_normal_mode() && cbl.so_out)
     flags |= ST_SO;
   return flags;
 }
@@ -308,6 +314,27 @@ u16 serialcable_mul_siocnt(void) {
   return (ME << 4) | (ME ? 0x4 : 0) | (ready ? 0x8 : 0);
 }
 
+// In multiplayer mode RCNT bits 0..3 read the SC/SD/SI/SO pins, and games
+// look at them (SC is low while a transfer is going on).
+static void cable_update_pins(void) {
+  if (in_multi_mode()) {
+    const u16 siocnt = read_ioreg(REG_SIOCNT);
+    u16 rcnt = read_ioreg(REG_RCNT) & ~0x000F;
+    rcnt |= (siocnt & 0x0080) ? 0 : 0x1;     // SC
+    rcnt |= (siocnt & 0x0008) ? 0x2 : 0;     // SD: everybody is ready
+    rcnt |= (siocnt & 0x0004) ? 0x4 : 0;     // SI
+    rcnt |= 0x8;                             // SO: idle high
+    write_ioreg(REG_RCNT, rcnt);
+  }
+}
+
+// Whether the game can be using the cable right now. If not, the network is
+// only read between frames (the frontend does it), not in the middle of them.
+static bool child_link_in_use(void) {
+  return cbl.s_live || cbl.s_inxfer || cbl.q_count || in_multi_mode() ||
+         (in_normal_mode() && (read_ioreg(REG_SIOCNT) & 0x0081) == 0x0080);
+}
+
 // Refresh the SIOCNT bits that are driven by the other consoles.
 static void cable_refresh_lines(void) {
   u16 siocnt = read_ioreg(REG_SIOCNT);
@@ -315,6 +342,7 @@ static void cable_refresh_lines(void) {
     if (ME)   // For children the start bit is just the busy flag.
       siocnt = (siocnt & ~0x0080) | (cbl.s_inxfer ? 0x0080 : 0);
     write_ioreg(REG_SIOCNT, (siocnt & 0xFF83) | serialcable_mul_siocnt());
+    cable_update_pins();
   }
   else if (in_normal_mode()) {
     // SO of the parent is wired to the SI of the second console.
@@ -335,6 +363,7 @@ void serialcable_reset(void) {
   cbl.s_streak = 0;
   cbl.s_epending = cbl.s_esent = 0;
   cbl.s_replied = 0;
+  cbl.so_out = 0;
   cbl.status_sent = ST_UNKNOWN;
   cbl.link_dirty = 1;
 }
@@ -356,6 +385,11 @@ void serialcable_peer_disconnected(uint16_t client_id) {
 
 // Called after SIOCNT/RCNT are written, with the registers already updated.
 void serialcable_mode_changed(void) {
+  const u16 siocnt = read_ioreg(REG_SIOCNT);
+  // SO follows SIOCNT bit 3 only while no transfer is going on.
+  if (!(siocnt & 0x0080))
+    cbl.so_out = (siocnt & 0x0008) ? 1 : 0;
+  cable_update_pins();
   cable_sync_status();
 }
 
@@ -394,6 +428,10 @@ static bool cable_wait_step(cable_wait_t *w, u32 timeout_us) {
   // stuck somewhere (menu, pause), and there is no point in spinning.
   if (elapsed > CBL_NAP_AFTER_US)
     usleep(CBL_NAP_US);
+  else
+    // The answer is on its way: let whatever brings it in (the network
+    // driver's threads) run now, instead of competing with us for the CPU.
+    sched_yield();
 #endif
   return true;
 }
@@ -414,7 +452,7 @@ u16 serialcable_normal_write(u16 oldval, u16 newval) {
     cbl.m_busy = 1;
     cbl.m_mode = XMODE_NORMAL;
     cbl.m_bits32 = (newval & 0x1000) ? 1 : 0;
-    cbl.m_mask = cbl.peer[1].present ? 0x2 : 0;
+    cbl.m_mask = 0;      // Our SI is grounded: nothing to wait for.
     cbl.m_cycles = (newval & 0x2) ? NORMAL_CYC_2MHZ_8BIT : NORMAL_CYC_256KHZ_8BIT;
     if (cbl.m_bits32)
       cbl.m_cycles <<= 2;
@@ -422,7 +460,7 @@ u16 serialcable_normal_write(u16 oldval, u16 newval) {
                                 (read_ioreg(REG_SIODATA8) & 0xFF);
     cbl.m_seq++;
 
-    if (cbl.m_mask) {
+    if (cbl.peer[1].present) {
       cable_send(1, PKT_XFER, cbl.m_seq, cbl.m_send,
                  XMODE_NORMAL | (cbl.m_bits32 << 16), cbl.clock);
       parent_xfer_started();
@@ -454,6 +492,10 @@ u16 serialcable_multi_write(u16 oldval, u16 newval) {
     cbl.m_cycles = multi_cycles[newval & 0x3] * (count + 1);
     cbl.m_send = read_ioreg(REG_SIOMLT_SEND);
     cbl.m_seq++;
+
+    // The received words read FFFF until the transfer is over.
+    for (i = 0; i <= 3; i++)
+      write_ioreg(REG_SIOMULTI0 + i, 0xFFFF);
 
     if (cbl.m_mask) {
       cable_send(RETRO_NETPACKET_BROADCAST, PKT_XFER, cbl.m_seq, cbl.m_send,
@@ -518,6 +560,8 @@ static bool parent_complete(void) {
              (cbl.peer[i].reply[cbl.m_seq & 1].data & 0xFFFF) : 0xFFFF;
     for (i = 0; i <= 3; i++)
       write_ioreg(REG_SIOMULTI0 + i, w[i]);
+    write_ioreg(REG_SIOCNT, siocnt);
+    cable_update_pins();
 
     // A lone child already knows both words.
     if (cbl.m_mask & (cbl.m_mask - 1)) {
@@ -527,17 +571,22 @@ static bool parent_complete(void) {
     }
   }
   else {
-    u32 data = (parent_expects(1) && parent_has_reply(1)) ?
-               cbl.peer[1].reply[cbl.m_seq & 1].data : 0xFFFFFFFF;
+    // With the cable plugged our SI is grounded, unplugged it is pulled up.
+    const u32 data = netpacket_active() ? 0 : 0xFFFFFFFF;
     if (cbl.m_bits32) {
       write_ioreg(REG_SIODATA32_L, data & 0xFFFF);
       write_ioreg(REG_SIODATA32_H, data >> 16);
     }
     else
-      write_ioreg(REG_SIODATA8, data & 0xFF);
+      write_ioreg(REG_SIODATA8, (read_ioreg(REG_SIODATA8) & 0xFF00) | (data & 0xFF));
+    write_ioreg(REG_SIOCNT, siocnt);
+    // The transfer is over: SO goes back to SIOCNT bit 3.
+    if (cbl.so_out != ((siocnt & 0x0008) ? 1 : 0)) {
+      cbl.so_out = !cbl.so_out;
+      cbl.link_dirty = 1;
+    }
   }
 
-  write_ioreg(REG_SIOCNT, siocnt);
   return (siocnt & 0x4000) != 0;
 }
 
@@ -634,6 +683,7 @@ static bool child_finish(u16 w0, u16 w1, u16 w2, u16 w3) {
   write_ioreg(REG_SIOMULTI2, w2);
   write_ioreg(REG_SIOMULTI3, w3);
   write_ioreg(REG_SIOCNT, siocnt);
+  cable_update_pins();
 
   return (siocnt & 0x4000) != 0;
 }
@@ -724,29 +774,32 @@ static bool child_xfer(const cable_event *ev) {
 
     // Our word follows once the game had its time to load it, see
     // child_update.
-    if (in_multi_mode())
+    if (in_multi_mode()) {
+      write_ioreg(REG_SIOMULTI0, 0xFFFF);
+      write_ioreg(REG_SIOMULTI1, 0xFFFF);
+      write_ioreg(REG_SIOMULTI2, 0xFFFF);
+      write_ioreg(REG_SIOMULTI3, 0xFFFF);
       write_ioreg(REG_SIOCNT, siocnt | 0x0080);     // Busy
+      cable_update_pins();
+    }
   }
   else if (ME == 1) {
     const bool bits32 = (ev->b >> 16) & 1;
     // We must be waiting for an external clock, with the same word size.
     const bool ready = in_normal_mode() && (siocnt & 0x0081) == 0x0080 &&
                        ((siocnt & 0x1000) != 0) == bits32;
-    u32 data = 0xFFFFFFFF;
 
+    // The parent does not wait for us (its SI is grounded): no reply.
     if (ready) {
       if (bits32) {
-        data = read_ioreg32(REG_SIODATA32_L);
         write_ioreg(REG_SIODATA32_L, ev->a & 0xFFFF);
         write_ioreg(REG_SIODATA32_H, ev->a >> 16);
-      } else {
-        data = read_ioreg(REG_SIODATA8) & 0xFF;
-        write_ioreg(REG_SIODATA8, ev->a & 0xFF);
-      }
+      } else
+        write_ioreg(REG_SIODATA8, (read_ioreg(REG_SIODATA8) & 0xFF00) | (ev->a & 0xFF));
       siocnt &= ~0x0080;
       write_ioreg(REG_SIOCNT, siocnt);
+      cbl.so_out = (siocnt & 0x0008) ? 1 : 0;
     }
-    cable_send(0, PKT_REPLY, ev->seq, data, XMODE_NORMAL, 0);
 
     return ready && (siocnt & 0x4000);
   }
@@ -791,7 +844,8 @@ static bool child_update(unsigned cycles) {
   cbl.poll_cycles += cycles;
   if (cbl.poll_cycles >= CBL_POLL_CYCLES) {
     cbl.poll_cycles = 0;
-    netpacket_poll_receive();
+    if (child_link_in_use())
+      netpacket_poll_receive();
   }
 
   child_sync();

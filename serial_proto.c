@@ -34,7 +34,10 @@
 #endif
 
 #define MAX_QPACK             128    // 1 packet per frame (~2 second buffer, maybe too big)
-#define MAX_FPACK             512    // ~2 words per frame (can accumulate up to 256 words per frame)
+// Words queued per peer. A single packet can carry up to 255 words and TCP
+// can deliver a few of them at once: with only 512 the extra ones were
+// dropped, and both games were out of sync from then on.
+#define MAX_FPACK            4096
 
 
 void netpacket_send(uint16_t client_id, const void *buf, size_t len);
@@ -72,6 +75,7 @@ static union {
     u16 checksum;
     u8 offset;                   // Current frame offset
     u8 hscnt;                    // Number of handshake tokens sent
+    u8 kacnt;                    // Frames since the last keepalive
     unsigned frcnt;              // Frame counter for events.
   } poke;
 
@@ -111,6 +115,7 @@ static union {
 #define SLAVE_IRQ_CYCLES_C   28672   // Aproximately every 1.7ms, ~9.5 per frame.
 #define SLAVE_IRQ_CYCLES_H  280064   // Aproximately every frame (16.66ms).
 #define MAX_FRAME_TIMEOUT      240   // After four seconds consider the peer gone.
+#define KEEPALIVE_FRAMES        60   // Tell our state at least once a second.
 
 // Pokemon protocol constants
 #define MASTER_HANDSHAKE    0x8FFF
@@ -236,6 +241,15 @@ void serialpoke_master_send(void) {
 
 void serialpoke_frame_update(void) {
   u32 i;
+
+  // Packets only go out while the game is using the link: a game that stops
+  // for a while (ie. saving after a trade) would read as gone on the other
+  // consoles after MAX_FRAME_TIMEOUT. Keep reminding them of our state.
+  if (++serstate.poke.kacnt >= KEEPALIVE_FRAMES) {
+    serstate.poke.kacnt = 0;
+    serialpoke_senddata(serstate.poke.peer[netplay_client_id].state, NULL);
+  }
+
   for (i = 0; i <= 3; i++) {
     if (i != netplay_client_id)
       if (serstate.poke.peer[i].timeout++ >= MAX_FRAME_TIMEOUT)

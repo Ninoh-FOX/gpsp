@@ -142,6 +142,10 @@ u32 function_cc update_gba(int remaining_cycles)
     unsigned completed_cycles = execute_cycles - remaining_cycles;
     cpu_ticks += completed_cycles;
 
+    // Dual Cable Link: time moves on, wait for the other GBA if need be.
+    if (serial_mode == SERIAL_MODE_DUAL_CABLE)
+      dualport_sync(completed_cycles);
+
     remaining_cycles = 0;
 
     // Timers can trigger DMA (usually sound) and consume cycles
@@ -242,6 +246,9 @@ u32 function_cc update_gba(int remaining_cycles)
           // We completed a frame, tell the dynarec to exit to the main thread
           frame_complete = 0x80000000;
           frame_counter++;
+
+          if (serial_mode == SERIAL_MODE_DUAL_CABLE)
+            dualport_frame_end();
         }
 
         // Vcount trigger (flag) and IRQ if enabled

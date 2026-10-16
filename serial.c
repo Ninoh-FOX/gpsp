@@ -74,6 +74,9 @@ uint16_t serial_mul_siocnt() {
 }
 
 cpu_alert_type write_rcnt(u16 value) {
+  if (serial_mode == SERIAL_MODE_DUAL_CABLE)
+    return dualport_write_rcnt(value);
+  {
   u16 oldval = read_ioreg(REG_RCNT);
   u32 pvmode = get_serial_mode(oldval, read_ioreg(REG_RCNT));
   u32 nwmode = get_serial_mode(value, read_ioreg(REG_RCNT));
@@ -107,9 +110,13 @@ cpu_alert_type write_rcnt(u16 value) {
     serialcable_mode_changed();   // Let the other consoles know.
 
   return CPU_ALERT_NONE;
+  }
 }
 
 cpu_alert_type write_siocnt(u16 value) {
+  if (serial_mode == SERIAL_MODE_DUAL_CABLE)
+    return dualport_write_siocnt(value);
+  {
   u16 oldval = read_ioreg(REG_SIOCNT);
   u16 newval = (value & 0x7F8B) | (oldval & 0x0004);
   u32 pvmode = get_serial_mode(oldval, read_ioreg(REG_RCNT));
@@ -203,10 +210,13 @@ cpu_alert_type write_siocnt(u16 value) {
     serialcable_mode_changed();   // Let the other consoles know.
 
   return CPU_ALERT_NONE;
+  }
 }
 
 // How many cycles until the next serial event happens. Return MAX otherwise.
 u32 serial_next_event() {
+  if (serial_mode == SERIAL_MODE_DUAL_CABLE)
+    return dualport_next_event();
   if (serial_mode == SERIAL_MODE_SERIAL_CABLE)
     return serialcable_next_event();
   if (serial_irq_cycles)
@@ -218,6 +228,8 @@ u32 serial_next_event() {
 bool update_serial(unsigned cycles) {
   // Might wanna check if the connected device has some update (IRQ).
   switch (serial_mode) {
+  case SERIAL_MODE_DUAL_CABLE:
+    return dualport_update();
   case SERIAL_MODE_SERIAL_CABLE:
     // Has its own transfer scheduling.
     return serialcable_update(cycles);

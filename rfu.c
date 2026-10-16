@@ -19,6 +19,16 @@
 
 #include "common.h"
 
+// Packets waiting to be read by the game, per peer. Over TCP the network
+// delivers them in bursts, faster than the game polls the adapter: with
+// only 4 slots the extra ones were dropped.
+#define RFU_PKT_QUEUE_SIZE 16
+
+// While the game waits for an event the network is read every this many
+// cycles (~68 times per frame, 0.24ms), not on every scheduler event: each
+// read is a system call, and there are hundreds of events per frame.
+#define RFU_POLL_CYCLES    4096
+
 // Debug print logic:
 #ifdef RFU_DEBUG
   #define RFU_DEBUG_LOG(...) printf(__VA_ARGS__)
@@ -120,6 +130,7 @@ static u32 rfu_comstate, rfu_cnt, rfu_state;
 static u32 rfu_buf[255];
 static u8 rfu_cmd, rfu_plen;
 static u32 rfu_timeout_cycles, rfu_resp_timeout;
+static u32 rfu_poll_cycles;
 static u8 rfu_timeout, rfu_rtx_max;
 
 static struct {
@@ -138,7 +149,7 @@ static struct {
     struct {
       u32 datalen;   // Byte count of data waiting to be polled.
       u8  data[16];  // Data received from client.
-    } pkts[4];
+    } pkts[RFU_PKT_QUEUE_SIZE];
   } clients[4];      // Connected clients IDs (zero means empty slot).
 } rfu_host;
 
@@ -146,11 +157,11 @@ static struct {
   u16 devid;         // Device ID assigned to the client (by the host?)
   u16 clnum;         // Client number (0 to 3)
   u16 host_id;       // Client ID for the host device.
-  // Store host recevied packets (up to 8!)
+  // Store host received packets
   struct {
     u16 hblen;       // Bytes received from the host.
     u8 hdata[128];   // Data received from the host (accumulated).
-  } pkts[4];
+  } pkts[RFU_PKT_QUEUE_SIZE];
 } rfu_client;
 
 typedef struct {
@@ -503,8 +514,8 @@ static s32 rfu_process_command() {
           rfu_buf[0] |= dlen << (8 + i * 5);
           // Discard front packet
           memmove(&rfu_host.clients[i].pkts[0], &rfu_host.clients[i].pkts[1],
-                  3 * sizeof(rfu_host.clients[i].pkts[0]));
-          rfu_host.clients[i].pkts[3].datalen = 0;
+                  (RFU_PKT_QUEUE_SIZE - 1) * sizeof(rfu_host.clients[i].pkts[0]));
+          rfu_host.clients[i].pkts[RFU_PKT_QUEUE_SIZE - 1].datalen = 0;
         }
       }
       // Copy data into words into the RFU buffer.
@@ -521,8 +532,9 @@ static s32 rfu_process_command() {
         rfu_buf[cnt++] = leupack32(&rfu_client.pkts[0].hdata[j*4]);
 
       // Move to the next packet
-      memmove(&rfu_client.pkts[0], &rfu_client.pkts[1], sizeof(rfu_client.pkts[0]) * 3);
-      rfu_client.pkts[3].hblen = 0;
+      memmove(&rfu_client.pkts[0], &rfu_client.pkts[1],
+              sizeof(rfu_client.pkts[0]) * (RFU_PKT_QUEUE_SIZE - 1));
+      rfu_client.pkts[RFU_PKT_QUEUE_SIZE - 1].hblen = 0;
       return cnt;
     }
     break;
@@ -644,6 +656,7 @@ u32 rfu_transfer(u32 sent_value) {
     // and reverse the clock roles (the RFU becomes master).
     if (rfu_cmd == RFU_CMD_WAIT || rfu_cmd == RFU_CMD_RTX_WAIT || rfu_cmd == RFU_CMD_SEND_DATAW) {
       rfu_comstate = RFU_COMSTATE_WAITEVENT;
+      rfu_poll_cycles = RFU_POLL_CYCLES;   // Have a look right away
       rfu_timeout_cycles = rfu_timeout * (16777216 / 60);  // Frames to cycles
       rfu_resp_timeout = rfu_rtx_max * (16777216 / 60 / 6);  // RFU "frame" to cycles
     } else {
@@ -710,6 +723,30 @@ void rfu_frame_update() {
             memset(&rfu_host.clients[i], 0, sizeof(rfu_host.clients[i]));
           }
         }
+      }
+    }
+  }
+}
+
+// The network told us a peer is gone (or, with client_id < 0, that the whole
+// session is over). Without this a client whose host left stayed connected
+// forever, and a host kept a dead client for the 4s TTL. A client that is
+// no longer connected answers the game's next Wait with a disconnect event.
+void rfu_net_disconnect(int client_id) {
+  u32 i;
+  if (rfu_state == RFU_STATE_CLIENT) {
+    if (client_id < 0 || client_id == rfu_client.host_id) {
+      RFU_DEBUG_LOG("Host is gone, disconnecting\n");
+      memset(&rfu_client, 0, sizeof(rfu_client));
+      rfu_state = RFU_STATE_IDLE;
+    }
+  }
+  else if (rfu_state == RFU_STATE_HOST) {
+    for (i = 0; i < 4; i++) {
+      if (rfu_host.clients[i].devid &&
+          (client_id < 0 || rfu_host.clients[i].client_id == client_id)) {
+        RFU_DEBUG_LOG("Client slot %d is gone, disconnecting\n", i);
+        memset(&rfu_host.clients[i], 0, sizeof(rfu_host.clients[i]));
       }
     }
   }
@@ -816,7 +853,7 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
           rfu_net_send_cmd(client_id, NET_RFU_CLIENT_ACK,
                            rfu_client.devid | (rfu_client.clnum << 16));
           // Receive data from the host. Queue que packet if possible
-          for (i = 0; i < 4; i++) {
+          for (i = 0; i < RFU_PKT_QUEUE_SIZE; i++) {
             if (!rfu_client.pkts[i].hblen) {
               memcpy(&rfu_client.pkts[i].hdata, payl, blen);
               rfu_client.pkts[i].hblen = blen;
@@ -840,7 +877,7 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
         // Validate the slot with device ID
         if (rfu_host.clients[clid].devid == cdevid) {
           rfu_host.clients[clid].clttl = 0;   // Account for packet reception
-          for (i = 0; i < 4; i++) {
+          for (i = 0; i < RFU_PKT_QUEUE_SIZE; i++) {
             if (!rfu_host.clients[clid].pkts[i].datalen) {
               memcpy(rfu_host.clients[clid].pkts[i].data, payl, blen);
               rfu_host.clients[clid].pkts[i].datalen = blen;
@@ -881,7 +918,11 @@ bool rfu_update(unsigned cycles) {
      * rfu_peer_bcst[] and other rfu_* globals.  All reads below must
      * re-fetch these globals after this point - do NOT cache rfu_state
      * etc. into a local across this call. */
-    netpacket_poll_receive();
+    rfu_poll_cycles += cycles;
+    if (rfu_poll_cycles >= RFU_POLL_CYCLES) {
+      rfu_poll_cycles = 0;
+      netpacket_poll_receive();
+    }
 
     // Check if we are running our of time to respond.
     rfu_timeout_cycles -= MIN(cycles, rfu_timeout_cycles);

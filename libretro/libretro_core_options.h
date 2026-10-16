@@ -126,7 +126,7 @@ struct retro_core_option_definition option_defs_us[] = {
    {
       "gpsp_serial",
       "Link Cable Connectivity",
-      "Configures the serial (Link Cable) connection. Automatic will pick up a reasonable support for most known games.",
+      "Configures the serial (Link Cable) connection. Automatic uses the Wireless Adapter, Pokemon or Advance Wars mode for the games that need them, and the Cable Link for every other game. The Cable Link resets the client's game when the netplay session starts, as games only look for the cable at boot.",
       {
          { "auto",     "Automatic" },
          { "disabled", "Disabled" },
@@ -138,17 +138,6 @@ struct retro_core_option_definition option_defs_us[] = {
          { NULL, NULL },
       },
       "auto"
-   },
-   {
-      "gpsp_cable_boot",
-      "Cable Link to Boot",
-      "Only used by the 'Cable Link (real time)' mode. When enabled, joining a netplay session as a client resets the game, as if the console was switched on with the link cable already plugged in. Needed by games that only detect the link at boot (i.e. Mario Kart: Super Circuit, Zelda: Four Swords).",
-      {
-         { "disabled", NULL },
-         { "enabled",  NULL },
-         { NULL, NULL },
-      },
-      "disabled"
    },
    {
       "gpsp_rumble",

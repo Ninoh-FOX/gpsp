@@ -124,8 +124,7 @@ int sprite_limit = 1;
 static int rtc_mode = FEAT_AUTODETECT;
 static int rumble_mode = FEAT_AUTODETECT;
 static int serial_setting = SERIAL_MODE_AUTO;
-static bool cable_boot = false;            /* Reset clients when the cable gets plugged */
-static bool cable_boot_pending = false;
+static bool cable_boot_pending = false;    /* Reset the client when the cable gets plugged */
 
 u32 idle_loop_target_pc = 0xFFFFFFFF;
 u32 translation_gate_target_pc[MAX_TRANSLATION_GATES];
@@ -518,10 +517,14 @@ static void netpacket_start(uint16_t client_id, retro_netpacket_send_t send_fn, 
 
   if (serial_mode == SERIAL_MODE_SERIAL_CABLE) {
     serialcable_session_reset();
-    // "Cable Link to Boot": the client console is power cycled with the
-    // cable already plugged, so that games probing the link at boot see it.
-    if (client_id && cable_boot)
+    // The client console is power cycled with the cable already plugged, so
+    // that games probing the link at boot see it.
+    if (client_id)
       cable_boot_pending = true;
+#ifndef GPSP_INSTANCE_B
+    // Try the dual cable first (both GBAs on each console).
+    dual_session_start(client_id);
+#endif
   }
 }
 
@@ -529,6 +532,14 @@ static void netpacket_start(uint16_t client_id, retro_netpacket_send_t send_fn, 
 static void netpacket_stop() {
   netpacket_send_fn_ptr = NULL;
   netpacket_pollrcv_fn_ptr = NULL;
+
+  if (serial_mode == SERIAL_MODE_RFU)
+    rfu_net_disconnect(-1);   // Everybody is gone: tell the game.
+
+#ifndef GPSP_INSTANCE_B
+  // Back to a single GBA (and to the real time cable mode).
+  dual_session_stop();
+#endif
 
   if (serial_mode == SERIAL_MODE_SERIAL_CABLE) {
     // Cable unplugged: we are a lone console again.
@@ -552,6 +563,11 @@ static void netpacket_receive(const void* buf, size_t len, uint16_t client_id) {
     serialaw_net_receive(buf, len, client_id);
     break;
   case SERIAL_MODE_SERIAL_CABLE:
+  case SERIAL_MODE_DUAL_CABLE:
+#ifndef GPSP_INSTANCE_B
+    if (dual_net_receive(buf, len, client_id))
+      break;
+#endif
     serialcable_net_receive(buf, len, client_id);
     break;
   };
@@ -568,11 +584,20 @@ static bool netpacket_connected(uint16_t client_id) {
      MAX_SERMULT_NETPLAYERS,   // SERIAL_MODE_SERIAL_AW2
      0,                        // SERIAL_MODE_AUTO
      MAX_SERMULT_NETPLAYERS,   // SERIAL_MODE_SERIAL_CABLE
+     2,                        // SERIAL_MODE_DUAL_CABLE
   };
   const u32 max_clients = maxpl[serial_mode] - 1U;
 
   if (netplay_num_clients >= max_clients)
     return false;
+
+#ifndef GPSP_INSTANCE_B
+  if (serial_mode == SERIAL_MODE_SERIAL_CABLE ||
+      serial_mode == SERIAL_MODE_DUAL_CABLE) {
+    if (!dual_peer_connected(client_id))
+      return false;
+  }
+#endif
 
   netplay_num_clients++;
   return true;
@@ -580,6 +605,13 @@ static bool netpacket_connected(uint16_t client_id) {
 
 static void netpacket_disconnected(uint16_t client_id) {
   netplay_num_clients--;
+  if (serial_mode == SERIAL_MODE_RFU)
+    rfu_net_disconnect(client_id);
+#ifndef GPSP_INSTANCE_B
+  if (serial_mode == SERIAL_MODE_SERIAL_CABLE ||
+      serial_mode == SERIAL_MODE_DUAL_CABLE)
+    dual_peer_disconnected(client_id);
+#endif
   if (serial_mode == SERIAL_MODE_SERIAL_CABLE)
     serialcable_peer_disconnected(client_id);
 }
@@ -753,6 +785,10 @@ void retro_init(void)
    // This interface is actually optional
    environ_cb(RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE, (void*)&netpacket_iface);
 
+#ifndef GPSP_INSTANCE_B
+   dual_set_frontend(environ_cb, show_warning_message);
+#endif
+
    current_frameskip_type = no_frameskip;
    frameskip_threshold    = 0;
    frameskip_interval     = 0;
@@ -768,6 +804,9 @@ void retro_init(void)
 
 void retro_deinit(void)
 {
+#ifndef GPSP_INSTANCE_B
+   dual_shutdown();
+#endif
    perf_cb.perf_log();
    memory_term();
 
@@ -885,6 +924,10 @@ void retro_set_controller_port_device(unsigned port, unsigned device) {}
 
 void retro_reset(void)
 {
+#ifndef GPSP_INSTANCE_B
+   if (serial_mode == SERIAL_MODE_DUAL_CABLE)
+      return;     // Same as a state load: the other console has a copy
+#endif
    reset_gba();
 }
 
@@ -908,6 +951,12 @@ bool retro_unserialize(const void* data, size_t size)
 {
    if (size != GBA_STATE_MEM_SIZE)
       return false;
+
+#ifndef GPSP_INSTANCE_B
+   // The copy of this GBA on the other console cannot travel in time.
+   if (dual_running() || serial_mode == SERIAL_MODE_DUAL_CABLE)
+      return false;
+#endif
 
    return gba_load_state(data);
 }
@@ -1001,11 +1050,6 @@ static void check_variables(bool started_from_load)
 #else
    dynarec_enable = 0;
 #endif
-
-   var.key   = "gpsp_cable_boot";
-   var.value = NULL;
-   cable_boot = environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value &&
-                !strcmp(var.value, "enabled");
 
    var.key = "gpsp_rtc_time_source";
    var.value = NULL;
@@ -1363,6 +1407,22 @@ bool retro_load_game(const struct retro_game_info* info)
 
    set_memory_descriptors();
 
+#ifndef GPSP_INSTANCE_B
+   {
+      /* Everything that makes this GBA a different machine: the dual cable
+       * needs the same on both consoles. */
+      u32 i, cfg = 2166136261u;
+      const u32 v[] = { (u32)dynarec_enable, (u32)rtc_mode, (u32)rumble_mode,
+                        (u32)selected_boot_mode, idle_loop_target_pc,
+                        translation_gate_targets };
+      for (i = 0; i < sizeof(v) / sizeof(v[0]); i++)
+         cfg = (cfg ^ v[i]) * 16777619u;
+      for (i = 0; i < translation_gate_targets; i++)
+         cfg = (cfg ^ translation_gate_target_pc[i]) * 16777619u;
+      dual_game_loaded(info->path, cfg);
+   }
+#endif
+
    return true;
 }
 
@@ -1374,6 +1434,9 @@ bool retro_load_game_special(unsigned game_type,
 
 void retro_unload_game(void)
 {
+#ifndef GPSP_INSTANCE_B
+   dual_shutdown();
+#endif
    if (libretro_ff_enabled)
       set_fastforward_override(false);
 
@@ -1413,23 +1476,9 @@ size_t retro_get_memory_size(unsigned id)
    return 0;
 }
 
-void retro_run(void)
+/* Check whether the frame about to run should be skipped (not drawn) */
+static void update_frameskip(void)
 {
-   bool updated = false;
-   unsigned audio_frames = 1;
-
-   if (cable_boot_pending)
-   {
-      /* A netplay client just plugged the cable with "Cable Link to Boot" */
-      cable_boot_pending = false;
-      reset_gba();
-   }
-
-   input_poll_cb();
-   update_input();
-
-   rumble_frame_reset();
-
    /* Check whether current frame should
     * be skipped */
    skip_next_frame = 0;
@@ -1499,6 +1548,94 @@ void retro_run(void)
             &audio_latency);
       update_audio_latency = false;
    }
+
+#ifdef GPSP_INSTANCE_B
+   /* The copy of the other player's GBA is never seen */
+   skip_next_frame = 1;
+#endif
+}
+
+#ifndef GPSP_INSTANCE_B
+/* Dual Cable Link: a frame of both GBAs. Ours runs here, the other player's
+ * one (instance B) on its own thread; both talk through the cable. */
+static void retro_run_dual(void)
+{
+   bool updated = false;
+
+   input_poll_cb();
+   if (!dual_frame_begin(input_local_keys()))
+   {
+      /* The other console's buttons for this frame are not here yet. */
+      video_cb(NULL, GBA_SCREEN_WIDTH, GBA_SCREEN_HEIGHT, GBA_SCREEN_PITCH * 2);
+      return;
+   }
+
+   update_input();
+   rumble_frame_reset();
+   update_frameskip();
+
+   dual_b_frame_start();
+   #ifdef HAVE_DYNAREC
+   if (dynarec_enable)
+      execute_arm_translate(execute_cycles);
+   else
+   #endif
+   {
+      clear_gamepak_stickybits();
+      execute_arm(execute_cycles);
+   }
+   dual_b_frame_wait();
+   dual_frame_end();
+
+   if (rumble_cb) {
+     u32 strength = 0xffff * rumble_active_pct();
+     rumble_cb(0, RETRO_RUMBLE_WEAK,   MIN(strength, 0xffff));
+     rumble_cb(0, RETRO_RUMBLE_STRONG, MIN(strength, 0xffff) / 2);
+   }
+
+   audio_run();
+   video_run();
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
+      check_variables(false);
+}
+#endif
+
+void retro_run(void)
+{
+   bool updated = false;
+   unsigned audio_frames = 1;
+
+   if (cable_boot_pending)
+   {
+      /* A netplay client just plugged the cable */
+      cable_boot_pending = false;
+      reset_gba();
+   }
+
+#ifndef GPSP_INSTANCE_B
+   if (serial_mode == SERIAL_MODE_SERIAL_CABLE ||
+       serial_mode == SERIAL_MODE_DUAL_CABLE)
+   {
+      if (dual_setting_up())
+      {
+         /* Both GBAs are being set up: the game waits. */
+         video_cb(NULL, GBA_SCREEN_WIDTH, GBA_SCREEN_HEIGHT, GBA_SCREEN_PITCH * 2);
+         return;
+      }
+      if (dual_running())
+      {
+         retro_run_dual();
+         return;
+      }
+   }
+#endif
+
+   input_poll_cb();
+   update_input();
+
+   rumble_frame_reset();
+   update_frameskip();
 
    if (serial_mode == SERIAL_MODE_SERIAL_CABLE)
       serialcable_frame_start();

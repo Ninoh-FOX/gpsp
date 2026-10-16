@@ -1525,9 +1525,50 @@ static void rtc_init_base_time(void)
   rtc_base_time = (s64)t;
 }
 
+/* Dual Cable Link: this GBA also runs on the other console, whose clock and
+ * time zone are not ours. Both copies take the time from the savestate
+ * clock only, and read it as UTC: the owner of the GBA moves its base by its
+ * own time zone first, so that its player sees no change. */
+static bool rtc_dual = false;
+static s64 rtc_dual_offset = 0;
+
+void rtc_dual_begin(bool owner)
+{
+  if (owner)
+  {
+#if defined(__linux__) || defined(__APPLE__)
+    struct tm lt;
+    time_t now = time(NULL);
+    localtime_r(&now, &lt);
+    rtc_dual_offset = lt.tm_gmtoff;
+#else
+    rtc_dual_offset = 0;
+#endif
+    if (rtc_time_source == RTC_TIME_SOURCE_SYSTEM)
+      rtc_base_time = (s64)time(NULL) -
+                      (s64)((double)frame_counter * GBA_FRAME_SECONDS);
+    rtc_base_time += rtc_dual_offset;
+  }
+  else
+    rtc_dual_offset = 0;
+  rtc_dual = true;
+}
+
+void rtc_dual_end(void)
+{
+  if (rtc_dual)
+    rtc_base_time -= rtc_dual_offset;
+  rtc_dual = false;
+}
+
+static struct tm *rtc_break_time(time_t t, struct tm *out)
+{
+  return rtc_dual ? gmtime_r(&t, out) : localtime_r(&t, out);
+}
+
 static time_t rtc_current_time(void)
 {
-  if (rtc_time_source == RTC_TIME_SOURCE_SYSTEM)
+  if (rtc_time_source == RTC_TIME_SOURCE_SYSTEM && !rtc_dual)
     return time(NULL);
 
   return (time_t)(rtc_base_time +
@@ -1613,9 +1654,8 @@ static void write_rtc(u8 old, u8 new)
           break;
         case RTC_COMMAND_OUTPUT_TIME_FULL:
           {
-            struct tm *current_time;
-            time_t current_time_flat = rtc_current_time();
-            current_time = localtime(&current_time_flat);
+            struct tm tm_buf, *current_time;
+            current_time = rtc_break_time(rtc_current_time(), &tm_buf);
 
             rtc_state = RTC_OUTPUT_DATA;
             rtc_data_bits = 56;
@@ -1630,9 +1670,8 @@ static void write_rtc(u8 old, u8 new)
           break;
         case RTC_COMMAND_OUTPUT_TIME:
           {
-            struct tm *current_time;
-            time_t current_time_flat = rtc_current_time();
-            current_time = localtime(&current_time_flat);
+            struct tm tm_buf, *current_time;
+            current_time = rtc_break_time(rtc_current_time(), &tm_buf);
 
             rtc_state = RTC_OUTPUT_DATA;
             rtc_data_bits = 24;
@@ -3250,6 +3289,10 @@ u32 load_gamepak(const struct retro_game_info* info, const char *name,
          }
       }
    }
+
+   // Games without a link mode of their own use the real link cable.
+   if (serial_mode == SERIAL_MODE_AUTO)
+      serial_mode = SERIAL_MODE_SERIAL_CABLE;
 	
    normalize_blank_backup_for_detected_type();
 

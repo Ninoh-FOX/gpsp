@@ -518,8 +518,10 @@ else ifeq ($(platform), miyoomini)
 	AR = /opt/miyoomini-toolchain/usr/bin/arm-linux-ar
 	fpic := -fPIC
 	SHARED := -shared -Wl,--version-script=link.T -Wl,--no-undefined
+	NM = /opt/miyoomini-toolchain/usr/bin/arm-linux-nm
+	OBJCOPY = /opt/miyoomini-toolchain/usr/bin/arm-linux-objcopy
+	# No LTO: both GBAs (instances A and B) must be the very same machine code.
 	CFLAGS += -Ofast \
-	-flto=4 -fwhole-program -fuse-linker-plugin \
 	-fdata-sections -ffunction-sections -Wl,--gc-sections \
 	-fno-stack-protector -fno-ident -fomit-frame-pointer \
 	-falign-functions=1 -falign-jumps=1 -falign-loops=1 \
@@ -625,11 +627,38 @@ all: $(TARGET)
 
 # Linking with gcc on purpose, we do not use any libstdc++ dependencies at all, only libc is required.
 
-$(TARGET): $(OBJECTS)
+# Dual Cable Link: the second GBA (instance B) is the whole core built again
+# with -DGPSP_INSTANCE_B, linked into one object, and with every global it
+# defines renamed gbab_*. What it uses but does not define (libc, the cable
+# bus in dual.c) stays shared.
+NM      ?= nm
+OBJCOPY ?= objcopy
+DUAL_A_OBJECTS := $(OBJECTS) $(CORE_DIR)/dual.o
+DUAL_B_OBJECTS := $(patsubst $(CORE_DIR)/%,obj_b/%,$(OBJECTS))
+
+obj_b/%.o: $(CORE_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(INCFLAGS) $(CFLAGS) $(OPTIMIZE) -DGPSP_INSTANCE_B -Wno-unused-variable -Wno-unused-label -c -o $@ $<
+
+obj_b/%.o: $(CORE_DIR)/%.cc
+	@mkdir -p $(dir $@)
+	$(CXX) $(INCFLAGS) $(CXXFLAGS) $(OPTIMIZE) -DGPSP_INSTANCE_B -c -o $@ $<
+
+obj_b/%.o: $(CORE_DIR)/%.S
+	@mkdir -p $(dir $@)
+	$(CC) $(ASFLAGS) $(CFLAGS) $(OPTIMIZE) -DGPSP_INSTANCE_B -c -o $@ $<
+
+gpsp_b.o: $(DUAL_B_OBJECTS)
+	$(CC) -r -nostdlib -o gpsp_b_linked.o $(DUAL_B_OBJECTS)
+	$(NM) -g --defined-only gpsp_b_linked.o | awk 'NF == 3 { print $$3 " gbab_" $$3 }' > gpsp_b.syms
+	$(OBJCOPY) --redefine-syms=gpsp_b.syms gpsp_b_linked.o $@
+	rm -f gpsp_b_linked.o gpsp_b.syms
+
+$(TARGET): $(DUAL_A_OBJECTS) gpsp_b.o
 ifeq ($(STATIC_LINKING), 1)
-	$(AR) rcs $@ $(OBJECTS)
+	$(AR) rcs $@ $(DUAL_A_OBJECTS) gpsp_b.o
 else
-	$(CC) $(fpic) $(SHARED) $(INCFLAGS) $(OPTIMIZE) -o $@ $(OBJECTS) $(LIBM) $(LDFLAGS)
+	$(CC) $(fpic) $(SHARED) $(INCFLAGS) $(OPTIMIZE) -o $@ $(DUAL_A_OBJECTS) gpsp_b.o $(LIBM) $(LDFLAGS) -lpthread
 endif
 
 cpu_threaded.o: cpu_threaded.c
@@ -648,7 +677,8 @@ clean-objs:
 	rm -rf $(OBJECTS)
 
 clean:
-	rm -f $(OBJECTS) $(TARGET)
+	rm -f $(OBJECTS) $(CORE_DIR)/dual.o $(TARGET) gpsp_b.o
+	rm -rf obj_b
 
 .PHONY: clean
 endif

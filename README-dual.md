@@ -1,0 +1,71 @@
+# Dual Cable Link
+
+In gpSP the "Cable Link" mode runs **both GBAs on
+every console**: the player's own GBA, and a hidden copy of the other
+player's. The two GBAs of a console are joined by a link cable in memory, and
+only the buttons travel over the network. A game's link traffic never waits
+for the WiFi, however many transfers it makes per frame (Zelda: Four Swords,
+Street Fighter, ...). The price is a few frames of input delay, chosen
+automatically from the round trip time, and the CPU of a second GBA (it runs
+on the other CPU core).
+
+Every other mode, and Cable Link when the two consoles cannot use the dual
+link, works exactly as before.
+
+## How a session goes
+
+Both consoles select **Cable Link** (or **Automatic**, which picks Cable Link
+for every game without a Wireless Adapter, Pokemon or Advance Wars mode of
+its own) and start a netplay session (host and client) as usual.
+
+1. The consoles compare ROM, BIOS, core version and the settings that change
+   the machine. If anything differs, the real time cable is used instead,
+   exactly as in the main core.
+2. They measure the round trip time (input delay = one way + 2 frames).
+3. Each console freezes its GBA between two frames and sends it (savestate
+   and save memory, 544 KB) to the other one. Both games restart first, as
+   games only look for the cable at boot; each player keeps their own save.
+4. From then on only the buttons are sent. Every 2 seconds both consoles
+   compare both GBAs; if they ever differ the link is cut with a message.
+
+While linked, savestates cannot be loaded, reset is ignored, cheats are off
+and fast forward is disabled: all of them would make the two copies of a GBA
+different. When the other console leaves, the player's GBA carries on alone.
+
+## Code
+
+| file | what |
+|---|---|
+| `dual.h` | the design notes and the interfaces |
+| `serial_dual.c` | one end of the cable (SIOCNT/RCNT/SIO data, timing); in both instances |
+| `dual.c` | the cable between the two ends, instance B, network protocol, input lockstep; instance A only |
+| `Makefile` | builds instance B: the core again with `-DGPSP_INSTANCE_B`, partially linked, every global renamed `gbab_*` |
+
+Hooks in the core, all inactive unless `serial_mode == SERIAL_MODE_DUAL_CABLE`:
+`update_gba` (time sync, end of frame), `serial.c` (register writes,
+scheduling), `input.c` (buttons), `cheats.c`, the RTC (read in UTC from the
+savestate clock, so that both consoles agree), and `libretro.c`.
+
+## Build
+
+    make platform=miyoomini
+
+gives `gpsp_plus_libretro.so` (no LTO here: both GBAs must be the very same
+machine code).
+
+## Test without consoles
+
+`tools/dualtest` runs two consoles with RetroArch in one process, joined by a
+network in memory, on the real arm32 build under `qemu-arm`:
+
+    make -C tools/dualtest
+    tools/dualtest/run.sh $PWD/tools/dualtest/linktest.gba 1200 5 0
+    tools/dualtest/run.sh /path/to/game.gba 2400 5 600
+
+Arguments: ROM, frames, one-way latency (ms), frames each player plays alone
+first. `linktest.gba` (built from
+`linktest.c`) makes tens of multiplayer transfers per frame and the harness
+checks that both GBAs logged the same words. `run.sh debug ...` links a core
+whose cable prints what it does; `DUAL_FAULT=1` with it gives the hidden GBA
+other buttons once, to check that the agreement check catches it. `SERIAL=auto` (or any other value of the option) changes the link mode, `ROM2=...`
+gives the client another game (the real time cable must take over).
