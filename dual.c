@@ -97,6 +97,7 @@ extern u32 gbab_reg[];
 #define DUAL_HASH_EVERY    120         // Frames between agreement checks
 #define DUAL_HASH_SLOTS    4
 #define DUAL_HELLO_US      3000000     // No answer: the other core is not dual
+#define DUAL_HELLO_EVERY   250000      // HELLO sent again until the other one's comes
 #define DUAL_SETUP_US      30000000    // Whole setup
 #define DUAL_PEER_US       15000000    // Peer silent while playing: it is gone
 #define DUAL_STALL_US      12000       // Longest wait for buttons in a frame
@@ -130,6 +131,7 @@ static struct {
   u64 t_state;                  // When the current step started
   u64 t_heard;                  // Last packet from the peer
   bool hello_sent, hello_rcvd;
+  u64 t_hello;                  // Last HELLO sent
   u32 peer_hello[6];
   u32 rtt_us, rtt_samples;
   bool peer_ready;
@@ -547,6 +549,7 @@ static void dual_send_hello(void) {
   w[5] = ds.is_host ? 1 : 0;
   dual_send(DPK_HELLO, w, 6, NULL, 0);
   ds.hello_sent = true;
+  ds.t_hello = netpacket_time_usec();
 }
 
 static void dual_send_ping(void) {
@@ -670,7 +673,10 @@ static void dual_setup_step(void) {
   const u64 now = netpacket_time_usec();
 
   if (ds.state == DS_HELLO) {
-    if (!ds.hello_sent)
+    // The other console may not be listening yet (the host only is once the
+    // frontend tells it about the client): say it again until it answers.
+    if (!ds.hello_sent ||
+        (!ds.hello_rcvd && now - ds.t_hello > DUAL_HELLO_EVERY))
       dual_send_hello();
     if (ds.hello_rcvd) {
       if (!dual_hello_matches()) {
@@ -690,7 +696,9 @@ static void dual_setup_step(void) {
       dual_send_ping();
     }
     else if (now - ds.t_state > DUAL_HELLO_US) {
-      // The other console does not have this core: real time cable.
+      // The other console does not have this core: real time cable. Tell it,
+      // in case it heard us after all, so that it does not wait for us.
+      dual_send(DPK_BYE, NULL, 0, NULL, 0);
       ds.state = DS_OFF;
     }
     return;
@@ -903,9 +911,11 @@ bool dual_net_receive(const void *buf, size_t len, uint16_t client_id) {
       u32 i;
       for (i = 0; i < 6; i++)
         ds.peer_hello[i] = netorder32(pkt[2 + i]);
-      ds.hello_rcvd = true;
-      if (!ds.hello_sent)
+      // Answer the first one: ours may have been sent before the other
+      // console was listening.
+      if (!ds.hello_rcvd)
         dual_send_hello();
+      ds.hello_rcvd = true;
     }
     break;
 

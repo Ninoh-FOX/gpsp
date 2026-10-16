@@ -268,6 +268,21 @@ int main(int argc, char **argv) {
   if (!con[0].np_set || !con[1].np_set) { fprintf(stderr, "no netpacket interface\n"); return 2; }
   con[0].np.start(0, np_send0, np_poll0);
   con[1].np.start(1, np_send1, np_poll1);
+  /* LATE_CONNECT=N: the host hears about the client N frames after the
+   * client started (as RetroArch can do), so the client's first packets
+   * get to a host that is not listening yet. */
+  if (getenv("LATE_CONNECT")) {
+    unsigned late = (unsigned)atoi(getenv("LATE_CONNECT"));
+    for (f = 0; f < late; f++) {
+      con[0].keys = 0;
+      net_poll(0);
+      con[0].run();
+      con[1].keys = 0;
+      net_poll(1);
+      con[1].run();
+    }
+    printf("host told about the client %u frames late\n", late);
+  }
   if (con[0].np.connected && !con[0].np.connected(1)) { fprintf(stderr, "host refused client\n"); return 2; }
 
   for (i = 0; i < 2; i++)
