@@ -76,6 +76,7 @@ endif
 LIBM		   := -lm
 CORE_DIR    := .
 LDFLAGS     :=
+LIBPTHREAD  := -lpthread
 
 # Unix
 ifeq ($(platform), unix)
@@ -538,6 +539,43 @@ else ifeq ($(platform), miyoomini)
 	ARCH = arm
 	BUILTIN_GPU = neon
 
+# Android (NDK clang). One ABI per build:
+#   make platform=android ANDROID_ABI=arm64-v8a NDK=/path/to/ndk
+# ABIs: armeabi-v7a, arm64-v8a, x86, x86_64
+else ifeq ($(platform), android)
+	ANDROID_ABI ?= arm64-v8a
+	ANDROID_API ?= 21
+	NDK ?= $(ANDROID_NDK_HOME)
+	NDK_BIN := $(NDK)/toolchains/llvm/prebuilt/linux-x86_64/bin
+	TARGET := $(TARGET_NAME)_plus_libretro_android.so
+	fpic := -fPIC
+	# Bionic has pthreads inside libc; no libstdc++ needed.
+	SHARED := -shared -Wl,--version-script=link.T -Wl,--no-undefined -nostdlib++
+	LIBPTHREAD :=
+	AR = $(NDK_BIN)/llvm-ar
+	NM = $(NDK_BIN)/llvm-nm
+	OBJCOPY = $(NDK_BIN)/llvm-objcopy
+	HAVE_DYNAREC := 1
+	MMAP_JIT_CACHE = 1
+	ifeq ($(ANDROID_ABI), armeabi-v7a)
+		ANDROID_TRIPLE := armv7a-linux-androideabi
+		CPU_ARCH := arm
+		CFLAGS += -marm
+	else ifeq ($(ANDROID_ABI), arm64-v8a)
+		ANDROID_TRIPLE := aarch64-linux-android
+		CPU_ARCH := arm64
+	else ifeq ($(ANDROID_ABI), x86)
+		ANDROID_TRIPLE := i686-linux-android
+		CPU_ARCH := x86_32
+	else ifeq ($(ANDROID_ABI), x86_64)
+		ANDROID_TRIPLE := x86_64-linux-android
+		CPU_ARCH := x86_32
+	else
+		$(error Unknown ANDROID_ABI '$(ANDROID_ABI)')
+	endif
+	CC = $(NDK_BIN)/$(ANDROID_TRIPLE)$(ANDROID_API)-clang
+	CXX = $(NDK_BIN)/$(ANDROID_TRIPLE)$(ANDROID_API)-clang++
+
 # Windows
 else
 	TARGET := $(TARGET_NAME)_libretro.dll
@@ -664,7 +702,7 @@ $(TARGET): $(DUAL_A_OBJECTS) $(DUAL_HIDDEN_OBJECTS)
 ifeq ($(STATIC_LINKING), 1)
 	$(AR) rcs $@ $(DUAL_A_OBJECTS) $(DUAL_HIDDEN_OBJECTS)
 else
-	$(CC) $(fpic) $(SHARED) $(INCFLAGS) $(OPTIMIZE) -o $@ $(DUAL_A_OBJECTS) $(DUAL_HIDDEN_OBJECTS) $(LIBM) $(LDFLAGS) -lpthread
+	$(CC) $(fpic) $(SHARED) $(INCFLAGS) $(OPTIMIZE) -o $@ $(DUAL_A_OBJECTS) $(DUAL_HIDDEN_OBJECTS) $(LIBM) $(LDFLAGS) $(LIBPTHREAD)
 endif
 
 cpu_threaded.o: cpu_threaded.c
