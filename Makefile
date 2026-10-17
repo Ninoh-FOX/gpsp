@@ -627,10 +627,11 @@ all: $(TARGET)
 
 # Linking with gcc on purpose, we do not use any libstdc++ dependencies at all, only libc is required.
 
-# Dual Cable Link: the second GBA (instance B) is the whole core built again
-# with -DGPSP_INSTANCE_B, linked into one object, and with every global it
-# defines renamed gbab_*. What it uses but does not define (libc, the cable
-# bus in dual.c) stays shared.
+# Dual Cable Link: the other GBAs (the hidden instances B, C and D) are the
+# whole core built again with -DGPSP_INSTANCE_B, linked into one object, and
+# copied three times with every global it defines renamed gbab_*, gbac_* and
+# gbad_*. What it uses but does not define (libc, the cable bus in dual.c)
+# stays shared.
 NM      ?= nm
 OBJCOPY ?= objcopy
 DUAL_A_OBJECTS := $(OBJECTS) $(CORE_DIR)/dual.o
@@ -648,17 +649,22 @@ obj_b/%.o: $(CORE_DIR)/%.S
 	@mkdir -p $(dir $@)
 	$(CC) $(ASFLAGS) $(CFLAGS) $(OPTIMIZE) -DGPSP_INSTANCE_B -c -o $@ $<
 
-gpsp_b.o: $(DUAL_B_OBJECTS)
-	$(CC) -r -nostdlib -o gpsp_b_linked.o $(DUAL_B_OBJECTS)
-	$(NM) -g --defined-only gpsp_b_linked.o | awk 'NF == 3 { print $$3 " gbab_" $$3 }' > gpsp_b.syms
-	$(OBJCOPY) --redefine-syms=gpsp_b.syms gpsp_b_linked.o $@
-	rm -f gpsp_b_linked.o gpsp_b.syms
+DUAL_HIDDEN_OBJECTS := gpsp_b.o gpsp_c.o gpsp_d.o
 
-$(TARGET): $(DUAL_A_OBJECTS) gpsp_b.o
+gpsp_hidden.o: $(DUAL_B_OBJECTS)
+	$(CC) -r -nostdlib -o $@ $(DUAL_B_OBJECTS)
+
+# gpsp_b.o: every global renamed gbab_*, and so on.
+$(DUAL_HIDDEN_OBJECTS): gpsp_hidden.o
+	$(NM) -g --defined-only $< | awk 'NF == 3 { print $$3 " gba$(subst gpsp_,,$(basename $@))_" $$3 }' > $@.syms
+	$(OBJCOPY) --redefine-syms=$@.syms $< $@
+	rm -f $@.syms
+
+$(TARGET): $(DUAL_A_OBJECTS) $(DUAL_HIDDEN_OBJECTS)
 ifeq ($(STATIC_LINKING), 1)
-	$(AR) rcs $@ $(DUAL_A_OBJECTS) gpsp_b.o
+	$(AR) rcs $@ $(DUAL_A_OBJECTS) $(DUAL_HIDDEN_OBJECTS)
 else
-	$(CC) $(fpic) $(SHARED) $(INCFLAGS) $(OPTIMIZE) -o $@ $(DUAL_A_OBJECTS) gpsp_b.o $(LIBM) $(LDFLAGS) -lpthread
+	$(CC) $(fpic) $(SHARED) $(INCFLAGS) $(OPTIMIZE) -o $@ $(DUAL_A_OBJECTS) $(DUAL_HIDDEN_OBJECTS) $(LIBM) $(LDFLAGS) -lpthread
 endif
 
 cpu_threaded.o: cpu_threaded.c
@@ -677,7 +683,7 @@ clean-objs:
 	rm -rf $(OBJECTS)
 
 clean:
-	rm -f $(OBJECTS) $(CORE_DIR)/dual.o $(TARGET) gpsp_b.o
+	rm -f $(OBJECTS) $(CORE_DIR)/dual.o $(TARGET) gpsp_hidden.o $(DUAL_HIDDEN_OBJECTS)
 	rm -rf obj_b
 
 .PHONY: clean

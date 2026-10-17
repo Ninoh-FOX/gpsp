@@ -511,6 +511,10 @@ u32 arm_to_a64_reg[] =
 
 #define generate_shift_reg(arm_reg, name, flags_op)                           \
   u32 rs = ((opcode >> 8) & 0x0F);                                            \
+  /* Only the bottom byte of rs counts (a shift by 256 is no shift) */        \
+  check_load_reg_pc(arm_reg_a1, rs, 8);                                       \
+  aa64_emit_andi(reg_a1, arm_to_a64_reg[rs], 0, 7);  /* & 0xFF */             \
+  rs = arm_reg_a1;                                                            \
   generate_shift_reg_##name##_##flags_op(rm, rs);                             \
   rm = arm_reg                                                                \
 
@@ -1072,7 +1076,7 @@ u32 execute_spsr_restore_body(u32 address)
 #define generate_op_mvns_imm(_rd, _rn)                                        \
   generate_load_imm(_rd, (~imm));                                             \
   aa64_emit_movlo(reg_n_cache, (~(imm)) >> 31);                               \
-  aa64_emit_movlo(reg_z_cache, (~(imm)) ? 1 : 0);                             \
+  aa64_emit_movlo(reg_z_cache, (~(imm)) ? 0 : 1);                             \
 
 #define generate_op_mov_reg(_rd, _rn, _rm)                                    \
   aa64_emit_mov(_rd, _rm)                                                     \
@@ -1599,6 +1603,9 @@ u32 execute_store_cpsr_body(u32 _cpsr, u32 address, u32 store_mask)
 #define thumb_generate_shift_reg(name)                                        \
 {                                                                             \
   u32 original_rd = rd;                                                       \
+  /* Only the bottom byte of rs counts (a shift by 256 is no shift) */        \
+  aa64_emit_andi(reg_a1, arm_to_a64_reg[rs], 0, 7);  /* & 0xFF */             \
+  rs = arm_reg_a1;                                                            \
   if(check_generate_c_flag)                                                   \
   {                                                                           \
     generate_shift_reg_##name##_flags(rd, rs);                                \

@@ -36,7 +36,10 @@ u32 sound_on;
 static s32 sound_buffer[BUFFER_SIZE];
 static u32 sound_buffer_base;
 
-static fixed16_16 gbc_sound_tick_step;
+/* The PSG frame sequencer (length, envelope, sweep) runs at 256 Hz: each
+ * output sample moves it 256 / sound_frequency of a tick, in 16.16. It
+ * follows the output rate (at 32768 Hz a fixed 256 ran it at half speed). */
+#define gbc_sound_tick_step ((fixed16_16)(1u << (24 - sound_freq_bits)))
 
 /* Queue 4 samples to the top of the DS FIFO, wrap around circularly */
 
@@ -619,9 +622,6 @@ void reset_sound(void)
 
 void init_sound()
 {
-  /* 256 / sound_frequency in 16.16 == 256 (sound_frequency == 2^16). */
-  gbc_sound_tick_step = (fixed16_16)256u;
-
   init_noise_table(noise_table15, 32767, 14);
   init_noise_table(noise_table7, 127, 6);
 
@@ -646,7 +646,7 @@ bool sound_check_savestate(const u8 *src)
     "len-status", "len-ticks", "noise-type", "sample-tbl"
   };
 
-  int i;
+  int i, j;
   const u8 *snddoc = bson_find_key(src, "sound");
   if (!snddoc)
     return false;
@@ -665,8 +665,9 @@ bool sound_check_savestate(const u8 *src)
     if (!sndchan)
       return false;
 
-    for (i = 0; i < sizeof(dsvars)/sizeof(dsvars[0]); i++)
-      if (!bson_contains_key(sndchan, dsvars[i], BSON_TYPE_INT32))
+    /* (j: i is the channel, every one of them is checked) */
+    for (j = 0; j < sizeof(dsvars)/sizeof(dsvars[0]); j++)
+      if (!bson_contains_key(sndchan, dsvars[j], BSON_TYPE_INT32))
         return false;
 
     if (!bson_contains_key(sndchan, "fifo-bytes", BSON_TYPE_BIN))
@@ -680,8 +681,8 @@ bool sound_check_savestate(const u8 *src)
     if (!sndchan)
       return false;
 
-    for (i = 0; i < sizeof(gsvars)/sizeof(gsvars[0]); i++)
-      if (!bson_contains_key(sndchan, gsvars[i], BSON_TYPE_INT32))
+    for (j = 0; j < sizeof(gsvars)/sizeof(gsvars[0]); j++)
+      if (!bson_contains_key(sndchan, gsvars[j], BSON_TYPE_INT32))
         return false;
   }
 

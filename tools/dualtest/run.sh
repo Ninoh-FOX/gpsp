@@ -19,7 +19,7 @@ if [ "$1" = "debug" ]; then
   $TC-gcc $CFLAGS -c $CORE_DIR/dual.c -o $OUT/dual_dbg.o
   OBJS=$(cd $CORE_DIR && make -s -p platform=miyoomini -q 2>/dev/null | sed -n 's/^OBJECTS := //p' | head -1)
   (cd $CORE_DIR && $TC-gcc -fPIC -shared -Wl,--version-script=link.T -Wl,--no-undefined \
-     -o $OUT/gpsp_dbg.so $OBJS $OUT/dual_dbg.o gpsp_b.o -lm -lpthread)
+     -o $OUT/gpsp_dbg.so $OBJS $OUT/dual_dbg.o gpsp_b.o gpsp_c.o gpsp_d.o -lm -lpthread)
   CORE=$OUT/gpsp_dbg.so
 fi
 

@@ -18,13 +18,15 @@
 // One end of the in-memory link cable (Dual Cable Link, see dual.h).
 // This file is part of both core instances: each GBA has its own port.
 //
-// The cable is an AGB-005 Game Link Cable (GBATEK):
-//  - The parent's SI is grounded, the child's SI is the parent's SO. SC and
-//    SD are common wires.
+// The cable is an AGB-005 Game Link Cable (GBATEK), for 2 to 4 GBAs:
+//  - The parent's SI is grounded, each child's SI is the SO of the one
+//    before it (slot - 1). SC and SD are common wires.
 //  - Multiplayer: only the parent starts. SIOMULTI0-3 read FFFF during the
-//    transfer and [parent, child, FFFF, FFFF] at the end, on both ends.
-//  - Normal mode goes one way: the child gets the parent's bits, the parent
-//    always gets zero (its SI is grounded).
+//    transfer and the word of each GBA at the end (FFFF where there is
+//    none), on every end.
+//  - Normal mode is for two: between the parent and the first child. The
+//    child gets the parent's bits, the parent always gets zero (its SI is
+//    grounded).
 //  - General purpose: the pins as wired above.
 //
 // TIME. Each port counts session cycles; both GBAs start the session at the
@@ -73,14 +75,15 @@ static const u32 dual_mp_cycles[4] = { 31457, 7864, 5242, 2621 };
 static struct {
   u32 active;
   u32 slot;
+  u32 n;                // GBAs on the cable
   u64 clock;            // Session cycles
   u64 promised;         // Nothing we do is stamped earlier than this
   u32 keys;             // Buttons for the current frame
 
   u32 wires_sent;       // Last wire word posted (~0: none)
   u32 so_out;           // Normal mode SO level (latched while busy)
-  u32 p_wires;          // The other port, as last heard
-  u32 p_known;
+  u32 p_wires[4];       // The other ports, as last heard
+  u32 p_known;          // (one bit per port)
 
   u32 xfer;             // DX_*
   u64 t_done;
@@ -90,6 +93,13 @@ static struct {
   u16 word_parent;      // Multiplayer: the parent's word...
   u16 word_own;         // ...and ours (child)
 } dp;
+
+#define DP_KNOWN(s)      ((dp.p_known >> (s)) & 1)
+
+// The other end of a normal mode cable: the parent and the first child.
+static int dual_partner(void) {
+  return (dp.slot < 2 && dp.n >= 2) ? (int)(dp.slot ^ 1) : -1;
+}
 
 static u32 dual_mode(void) {
   const u16 siocnt = read_ioreg(REG_SIOCNT);
@@ -131,6 +141,13 @@ static u32 dual_wires(void) {
   return w;
 }
 
+static void dual_post_all(const dual_event *ev) {
+  u32 s;
+  for (s = 0; s < dp.n; s++)
+    if (s != dp.slot)
+      dualbus_post(dp.slot, s, ev);
+}
+
 static void dual_post_wires(u64 t) {
   const u32 w = dual_wires();
   if (w != dp.wires_sent) {
@@ -139,16 +156,37 @@ static void dual_post_wires(u64 t) {
     ev.kind = DEV_WIRES;
     ev.t = t;
     ev.v0 = w;
-    dualbus_post(dp.slot, &ev);
+    dual_post_all(&ev);
     dp.wires_sent = w;
   }
 }
 
-// Our SI: grounded on the parent end, the parent's SO on the child.
+// Our SI: grounded on the parent end, the SO of the one before on a child.
 static u32 dual_si(void) {
   if (!dp.slot)
     return 0;
-  return dp.p_known ? ((dp.p_wires & DW_SO) != 0) : 1;
+  return DP_KNOWN(dp.slot - 1) ? ((dp.p_wires[dp.slot - 1] & DW_SO) != 0) : 1;
+}
+
+// SD in multiplayer: high once every other GBA is in multiplayer mode.
+static bool dual_all_multi(void) {
+  u32 s;
+  for (s = 0; s < dp.n; s++)
+    if (s != dp.slot && (!DP_KNOWN(s) ||
+                         ((dp.p_wires[s] >> DW_MODE_SH) & 7) != DMODE_MULTI))
+      return false;
+  return dp.n > 1;
+}
+
+// A common wire (SC or SD) in general purpose mode: any GBA driving it low
+// pulls it low, otherwise the pull-up keeps it high.
+static u32 dual_common_wire(u32 drive, u32 level) {
+  u32 s, v = 1;
+  for (s = 0; s < dp.n; s++)
+    if (s != dp.slot && DP_KNOWN(s) && (dp.p_wires[s] & drive) &&
+        !(dp.p_wires[s] & level))
+      v = 0;
+  return v;
 }
 
 // Refresh the bits driven by the other end (SIOCNT 2/3, RCNT 0-3). Returns
@@ -166,8 +204,7 @@ static bool dual_refresh_inputs(void) {
     break;
   case DMODE_MULTI:
     {
-      const bool sd = dp.p_known &&
-                      ((dp.p_wires >> DW_MODE_SH) & 7) == DMODE_MULTI;
+      const bool sd = dual_all_multi();
       const bool busy = (siocnt & 0x0080) != 0;
       siocnt = (siocnt & ~0x000C) | (si ? 0x0004 : 0) | (sd ? 0x0008 : 0);
       write_ioreg(REG_SIOCNT, siocnt);
@@ -180,12 +217,11 @@ static bool dual_refresh_inputs(void) {
   case DMODE_GPIO:
     {
       const u32 old_si = (rcnt >> 2) & 1;
-      const u32 pw = dp.p_known ? dp.p_wires : 0;
       u32 v = rcnt & 0x0F;
       if (!(rcnt & 0x10))   // SC input
-        v = (v & ~1u) | ((pw & DW_SC_DRIVE) ? ((pw & DW_SC) ? 1 : 0) : 1);
+        v = (v & ~1u) | dual_common_wire(DW_SC_DRIVE, DW_SC);
       if (!(rcnt & 0x20))   // SD input
-        v = (v & ~2u) | ((pw & DW_SD_DRIVE) ? ((pw & DW_SD) ? 2 : 0) : 2);
+        v = (v & ~2u) | (dual_common_wire(DW_SD_DRIVE, DW_SD) << 1);
       if (!(rcnt & 0x40))   // SI input
         v = (v & ~4u) | (si ? 4 : 0);
       if (!(rcnt & 0x80))   // SO input: nothing drives it on this cable
@@ -205,7 +241,7 @@ static void dual_mp_start_parent(u64 t) {
   dual_event ev;
   const u16 siocnt = read_ioreg(REG_SIOCNT);
   dp.xfer = DX_MP_PARENT;
-  dp.t_done = t + dual_mp_cycles[siocnt & 3] * 2;
+  dp.t_done = t + dual_mp_cycles[siocnt & 3] * dp.n;
   dp.seq++;
   dp.word_parent = read_ioreg(REG_SIOMLT_SEND);
   write_ioreg(REG_SIOMULTI0, 0xFFFF);
@@ -219,7 +255,7 @@ static void dual_mp_start_parent(u64 t) {
   ev.t_done = dp.t_done;
   ev.v0 = dp.word_parent;
   ev.seq = dp.seq;
-  dualbus_post(dp.slot, &ev);
+  dual_post_all(&ev);
 }
 
 static void dual_n_start_master(u64 t) {
@@ -237,7 +273,8 @@ static void dual_n_start_master(u64 t) {
   ev.t_done = dp.t_done;
   ev.v0 = is32 ? read_ioreg32(REG_SIODATA32_L) : (read_ioreg(REG_SIODATA8) & 0xFF);
   ev.a = dp.bits;
-  dualbus_post(dp.slot, &ev);
+  if (dual_partner() >= 0)
+    dualbus_post(dp.slot, dual_partner(), &ev);
 }
 
 // Something from the other end is due now.
@@ -247,14 +284,14 @@ static bool dual_apply(const dual_event *ev) {
 
   switch (ev->kind) {
   case DEV_WIRES:
-    dp.p_wires = ev->v0;
-    dp.p_known = 1;
+    dp.p_wires[ev->from] = ev->v0;
+    dp.p_known |= 1u << ev->from;
     return dual_refresh_inputs();
 
   case DEV_MP_START:
-    // Only the child gets these. It takes part if it is in multiplayer mode
-    // and not busy; either way the parent gets an answer.
-    if (dp.slot == 1 && mode == DMODE_MULTI && dp.xfer == DX_NONE) {
+    // Only the children get these. One takes part if it is in multiplayer
+    // mode and not busy; either way everybody gets an answer.
+    if (dp.slot && mode == DMODE_MULTI && dp.xfer == DX_NONE) {
       dp.xfer = DX_MP_CHILD;
       dp.seq = ev->seq;
       dp.t_done = ev->t_done;
@@ -280,8 +317,8 @@ static bool dual_apply(const dual_event *ev) {
       dp.xfer = DX_N_SLAVE;
       dp.bits = ev->a;
       dp.word_rx = dp.slot ? ev->v0 : 0;
-      // Our view of it is late by the lookahead when we are the parent.
-      dp.t_done = MAX(ev->t_done + (dp.slot ? 0 : DUAL_LOOKAHEAD), dp.clock);
+      // Our view of it is late by the lookahead when it comes from a child.
+      dp.t_done = MAX(ev->t_done + (ev->from ? DUAL_LOOKAHEAD : 0), dp.clock);
     }
     return false;
   };
@@ -297,20 +334,21 @@ static bool dual_complete(void) {
   case DX_MP_PARENT:
   case DX_MP_CHILD:
     {
-      u32 child = dp.word_own;
-      if (dp.xfer == DX_MP_PARENT) {
-        // The child answered this transfer when it got to its start (it is
-        // never behind by more than that): wait for the answer, whenever it
-        // gets here it is the same one.
-        u32 w;
-        child = dualbus_wait_reply(dp.slot, dp.seq, &w) ? (w & 0xFFFF) : 0xFFFF;
-      }
+      // Each child answered this transfer when it got to its start (none is
+      // ever that far behind): wait for the answers, whenever they get here
+      // they are the same ones.
+      u32 s;
       write_ioreg(REG_SIOMULTI0, dp.word_parent);
-      write_ioreg(REG_SIOMULTI1, child);
-      write_ioreg(REG_SIOMULTI2, 0xFFFF);
-      write_ioreg(REG_SIOMULTI3, 0xFFFF);
+      for (s = 1; s < 4; s++) {
+        u32 w = 0xFFFF;
+        if (s == dp.slot)
+          w = dp.word_own;
+        else if (s < dp.n && !dualbus_wait_reply(dp.slot, s, dp.seq, &w))
+          w = 0xFFFF;
+        write_ioreg(REG_SIOMULTI0 + s, w & 0xFFFF);
+      }
       siocnt &= ~(0x0080 | 0x0030 | 0x0040);
-      siocnt |= dp.slot ? 0x0010 : 0;               // ID
+      siocnt |= (dp.slot & 3) << 4;                 // ID
       write_ioreg(REG_SIOCNT, siocnt);
     }
     break;
@@ -323,8 +361,8 @@ static bool dual_complete(void) {
         rx = dp.word_rx;
       else if (!dp.slot)
         rx = 0;                                     // SI grounded
-      else                                          // The parent's idle SO
-        rx = (dp.p_known && (dp.p_wires & DW_SO)) ? 0xFFFFFFFF : 0;
+      else                                          // The idle SO before us
+        rx = dual_si() ? 0xFFFFFFFF : 0;
       if (dp.bits == 32) {
         write_ioreg(REG_SIODATA32_L, rx & 0xFFFF);
         write_ioreg(REG_SIODATA32_H, rx >> 16);
@@ -449,6 +487,7 @@ void dualport_begin(unsigned slot) {
   memset(&dp, 0, sizeof(dp));
   dp.active = 1;
   dp.slot = slot;
+  dp.n = dualbus_players();
   dp.wires_sent = ~0U;
   dp.so_out = (read_ioreg(REG_SIOCNT) & 0x0008) ? 1 : 0;
   // Anything that was going on is lost, the cable was just plugged in.

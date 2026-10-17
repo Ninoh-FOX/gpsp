@@ -114,6 +114,17 @@ void netpacket_poll_receive();
 bool netpacket_active(void);
 u64 netpacket_time_usec(void);
 
+// While the Dual Cable Link is getting ready (dual.c: hello, waiting for the
+// players, setup), this cable stays unplugged, so that the games do not wait
+// on the network meanwhile. If the dual cable is not used after all, it is
+// plugged then (serialcable_replug).
+#ifndef GPSP_INSTANCE_B
+bool dual_cable_pending(void);
+#define cable_plugged() (netpacket_active() && !dual_cable_pending())
+#else
+#define cable_plugged() netpacket_active()
+#endif
+
 #define NET_CABLE_HEADER       0x4d434236   // MCB6 (Multiplayer CaBle, v6)
 
 #define PKT_STATUS             1    // a: status flags
@@ -274,7 +285,7 @@ static bool in_normal_mode(void) {
 static bool parent_all_ready(void) {
   u32 i;
   for (i = 1; i <= 3; i++)
-    if (cbl.peer[i].present && !(cbl.peer[i].flags & ST_MULTI))
+    if (cable_plugged() && cbl.peer[i].present && !(cbl.peer[i].flags & ST_MULTI))
       return false;
   return true;
 }
@@ -294,7 +305,7 @@ static u8 own_status(void) {
 // Tell the other consoles about our mode/lines whenever they change.
 static void cable_sync_status(void) {
   u8 flags = own_status();
-  if (flags != cbl.status_sent && netpacket_active()) {
+  if (flags != cbl.status_sent && cable_plugged()) {
     cbl.status_sent = flags;
     cable_send(RETRO_NETPACKET_BROADCAST, PKT_STATUS, 0, flags, 0, 0);
   }
@@ -303,7 +314,7 @@ static void cable_sync_status(void) {
 // SI/SD/ID fields of SIOCNT in multiplayer mode.
 u16 serialcable_mul_siocnt(void) {
   bool ready;
-  if (!netpacket_active())
+  if (!cable_plugged())
     return 0x8;        // Nothing plugged: lone parent.
 
   if (!ME)
@@ -364,6 +375,13 @@ void serialcable_reset(void) {
   cbl.s_epending = cbl.s_esent = 0;
   cbl.s_replied = 0;
   cbl.so_out = 0;
+  cbl.status_sent = ST_UNKNOWN;
+  cbl.link_dirty = 1;
+}
+
+// The Dual Cable Link was not used after all: the cable gets plugged now, so
+// everybody hears where we are again.
+void serialcable_replug(void) {
   cbl.status_sent = ST_UNKNOWN;
   cbl.link_dirty = 1;
 }
@@ -460,7 +478,7 @@ u16 serialcable_normal_write(u16 oldval, u16 newval) {
                                 (read_ioreg(REG_SIODATA8) & 0xFF);
     cbl.m_seq++;
 
-    if (cbl.peer[1].present) {
+    if (cable_plugged() && cbl.peer[1].present) {
       cable_send(1, PKT_XFER, cbl.m_seq, cbl.m_send,
                  XMODE_NORMAL | (cbl.m_bits32 << 16), cbl.clock);
       parent_xfer_started();
@@ -481,7 +499,7 @@ u16 serialcable_multi_write(u16 oldval, u16 newval) {
     u32 i, count = 0;
     cbl.m_mask = 0;
     for (i = 1; i <= 3; i++) {
-      if (cbl.peer[i].present) {
+      if (cable_plugged() && cbl.peer[i].present) {
         cbl.m_mask |= 1 << i;
         count++;
       }
@@ -572,7 +590,7 @@ static bool parent_complete(void) {
   }
   else {
     // With the cable plugged our SI is grounded, unplugged it is pulled up.
-    const u32 data = netpacket_active() ? 0 : 0xFFFFFFFF;
+    const u32 data = cable_plugged() ? 0 : 0xFFFFFFFF;
     if (cbl.m_bits32) {
       write_ioreg(REG_SIODATA32_L, data & 0xFFFF);
       write_ioreg(REG_SIODATA32_H, data >> 16);
@@ -937,7 +955,7 @@ bool serialcable_frame_end(void) {
   const u64 now = netpacket_time_usec();
   s32 ahead;
 
-  if (!netpacket_active() || !cbl.f_entry)
+  if (!cable_plugged() || !cbl.f_entry)
     return false;
 
   if (!ME) {
@@ -1020,11 +1038,11 @@ bool serialcable_update(unsigned cycles) {
     cable_refresh_lines();
   }
 
-  if (!netpacket_active())
+  if (!cable_plugged())
     cbl.m_active = 0;
 
   if (ME)
-    return netpacket_active() ? child_update(cycles) : false;
+    return cable_plugged() ? child_update(cycles) : false;
 
   if (cbl.m_busy) {
     if (cbl.m_cycles > cycles)

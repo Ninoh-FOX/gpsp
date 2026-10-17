@@ -899,6 +899,8 @@ static inline void render_scanline_bitmap(
     }
 
     u32 pixel_x = (u32)(source_x >> 8);
+    if (pixel_x >= width)
+      return;   // Past the right edge: nothing to draw (width - pixel_x would wrap)
     u32 pixcnt = MIN(end - start, width - pixel_x);
     pixfmt *valptr = &src_ptr[pixel_x + (pixel_y * width)];
     pixfmt val = 0;

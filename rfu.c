@@ -461,12 +461,15 @@ static s32 rfu_process_command() {
     if (rfu_state == RFU_STATE_HOST) {
       // Read data to be sent into the TX buffer
       rfu_tx_buf.blen = rfu_buf[0] & 0x7F;
-      memcpy(rfu_tx_buf.buf, &rfu_buf[1], (rfu_plen - 1)*sizeof(u32));
+      // (The command length comes from the game: never past the buffer)
+      memcpy(rfu_tx_buf.buf, &rfu_buf[1],
+             MIN(rfu_plen - 1, sizeof(rfu_tx_buf.buf) / sizeof(u32)) * sizeof(u32));
     }
     else if (rfu_state == RFU_STATE_CLIENT) {
       // Same as above, but the header encoding is funny
       rfu_tx_buf.blen = (rfu_buf[0] >> (8 + rfu_client.clnum * 5)) & 0x1F;
-      memcpy(rfu_tx_buf.buf, &rfu_buf[1], (rfu_plen - 1)*sizeof(u32));
+      memcpy(rfu_tx_buf.buf, &rfu_buf[1],
+             MIN(rfu_plen - 1, sizeof(rfu_tx_buf.buf) / sizeof(u32)) * sizeof(u32));
     }
 
     /* fallthrough */
@@ -765,7 +768,7 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
     case NET_RFU_BROADCAST:
       // Fill the broadcast slot for the peer
       RFU_DEBUG_LOG("Got broadcast (client: #%d devID: %02x)\n", client_id, hdata);
-      if (client_id < MAX_RFU_PEERS) {
+      if (client_id < MAX_RFU_PEERS && len >= 12 + 6 * 4) {
         rfu_peer_bcst[client_id].device_id = hdata;
         rfu_peer_bcst[client_id].valid = 1;
         rfu_peer_bcst[client_id].ttl = 0xff;
@@ -874,8 +877,11 @@ void rfu_net_receive(const void* buf, size_t len, uint16_t client_id) {
         u32 clid = (hdata >> 16) & 0x3;
         u32 blen = hdata >> 24;
 
-        // Validate the slot with device ID
-        if (rfu_host.clients[clid].devid == cdevid) {
+        // Validate the slot with device ID (and the size: the packet says
+        // it, and a client never sends more than 16 bytes)
+        if (rfu_host.clients[clid].devid == cdevid &&
+            blen <= sizeof(rfu_host.clients[clid].pkts[0].data) &&
+            len >= blen + 12) {
           rfu_host.clients[clid].clttl = 0;   // Account for packet reception
           for (i = 0; i < RFU_PKT_QUEUE_SIZE; i++) {
             if (!rfu_host.clients[clid].pkts[i].datalen) {

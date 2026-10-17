@@ -509,6 +509,10 @@ u32 arm_to_mips_reg[] =
 
 #define generate_shift_reg(arm_reg, name, flags_op)                           \
   u32 rs = ((opcode >> 8) & 0x0F);                                            \
+  /* Only the bottom byte of rs counts (a shift by 256 is no shift) */        \
+  check_load_reg_pc(arm_reg_a1, rs, 8);                                       \
+  mips_emit_andi(reg_a1, arm_to_mips_reg[rs], 0xFF);                          \
+  rs = arm_reg_a1;                                                            \
   generate_shift_reg_##name##_##flags_op(rm, rs);                             \
   rm = arm_reg                                                                \
 
@@ -1576,6 +1580,9 @@ u32 execute_store_cpsr_body(u32 _cpsr, u32 address)
 #define thumb_generate_shift_reg(name)                                        \
 {                                                                             \
   u32 original_rd = rd;                                                       \
+  /* Only the bottom byte of rs counts (a shift by 256 is no shift) */        \
+  mips_emit_andi(reg_a1, arm_to_mips_reg[rs], 0xFF);                          \
+  rs = arm_reg_a1;                                                            \
   if(check_generate_c_flag)                                                   \
   {                                                                           \
     generate_shift_reg_##name##_flags(rd, rs);                                \

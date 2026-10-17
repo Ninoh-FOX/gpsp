@@ -140,6 +140,18 @@ struct retro_core_option_definition option_defs_us[] = {
       "auto"
    },
    {
+      "gpsp_cable_players",
+      "Cable Link players",
+      "How many GBAs are on the Cable Link (every console must have the same value). The host waits for all of them before the games restart, once. Each console runs every GBA, so 3 or 4 need more memory and CPU.",
+      {
+         { "2", NULL },
+         { "3", NULL },
+         { "4", NULL },
+         { NULL, NULL },
+      },
+      "2"
+   },
+   {
       "gpsp_rumble",
       "Rumble support",
       "Sets the Rumble support for the emulated cartridge. Autodetect uses a ROM database that works with most commercial titles. You might want to force Rumble when using homebrew or ROM hacks that support it. You can also force-disable it if you don't like it.",

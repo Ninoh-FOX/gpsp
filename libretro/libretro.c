@@ -125,6 +125,8 @@ static int rtc_mode = FEAT_AUTODETECT;
 static int rumble_mode = FEAT_AUTODETECT;
 static int serial_setting = SERIAL_MODE_AUTO;
 static bool cable_boot_pending = false;    /* Reset the client when the cable gets plugged */
+static unsigned cable_players = 2;         /* GBAs on the Cable Link (2-4) */
+static bool cable_dual_pending = false;    /* Real time cable unplugged meanwhile */
 
 u32 idle_loop_target_pc = 0xFFFFFFFF;
 u32 translation_gate_target_pc[MAX_TRANSLATION_GATES];
@@ -531,7 +533,46 @@ void netpacket_send(uint16_t client_id, const void *buf, size_t len) {
     netpacket_send_fn_ptr(RETRO_NETPACKET_RELIABLE | RETRO_NETPACKET_FLUSH_HINT, buf, len, client_id);
 }
 
+/* The Cable Link players option. Read again when a netplay session starts:
+ * it may have been changed in the menu just before, with no frame run since
+ * (the frame is what reads the changed options). */
+static void read_cable_players(void) {
+   struct retro_variable var;
+   var.key   = "gpsp_cable_players";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      const int players = atoi(var.value);
+      cable_players = (players >= 2 && players <= 4) ? (unsigned)players : 2;
+   }
+#ifndef GPSP_INSTANCE_B
+   dual_set_players(cable_players);
+#endif
+}
+
+#ifndef GPSP_INSTANCE_B
+/* Everything that makes this GBA a different machine: the dual cable needs
+ * the same on every console. (Worked out again for each netplay session:
+ * some of it can be changed in the menu.) */
+static u32 dual_machine_cfg(void)
+{
+   u32 i, cfg = 2166136261u;
+   const u32 v[] = { (u32)dynarec_enable, (u32)rtc_mode, (u32)rumble_mode,
+                     (u32)selected_boot_mode, idle_loop_target_pc,
+                     translation_gate_targets,
+                     /* (the sound channels' length and envelope counters,
+                      * which the game reads, step at this rate) */
+                     sound_freq_bits };
+   for (i = 0; i < sizeof(v) / sizeof(v[0]); i++)
+      cfg = (cfg ^ v[i]) * 16777619u;
+   for (i = 0; i < translation_gate_targets; i++)
+      cfg = (cfg ^ translation_gate_target_pc[i]) * 16777619u;
+   return cfg;
+}
+#endif
+
 static void netpacket_start(uint16_t client_id, retro_netpacket_send_t send_fn, retro_netpacket_poll_receive_t poll_receive_fn) {
+  read_cable_players();
   netpacket_send_fn_ptr = send_fn;
   netpacket_pollrcv_fn_ptr = poll_receive_fn;
   netplay_num_clients = 0;
@@ -539,13 +580,17 @@ static void netpacket_start(uint16_t client_id, retro_netpacket_send_t send_fn, 
 
   if (serial_mode == SERIAL_MODE_SERIAL_CABLE) {
     serialcable_session_reset();
+#ifndef GPSP_INSTANCE_B
+    // Try the dual cable first (every GBA on each console): it restarts
+    // every game once all the players are there. If the real time cable is
+    // used instead, the client restarts then (dual_take_boot_reset).
+    dual_set_cfg(dual_machine_cfg());
+    dual_session_start(client_id);
+#else
     // The client console is power cycled with the cable already plugged, so
     // that games probing the link at boot see it.
     if (client_id)
       cable_boot_pending = true;
-#ifndef GPSP_INSTANCE_B
-    // Try the dual cable first (both GBAs on each console).
-    dual_session_start(client_id);
 #endif
   }
 }
@@ -606,11 +651,24 @@ static bool netpacket_connected(uint16_t client_id) {
      MAX_SERMULT_NETPLAYERS,   // SERIAL_MODE_SERIAL_AW2
      0,                        // SERIAL_MODE_AUTO
      MAX_SERMULT_NETPLAYERS,   // SERIAL_MODE_SERIAL_CABLE
-     2,                        // SERIAL_MODE_DUAL_CABLE
+     MAX_SERMULT_NETPLAYERS,   // SERIAL_MODE_DUAL_CABLE
   };
-  const u32 max_clients = maxpl[serial_mode] - 1U;
+  u32 max_clients = maxpl[serial_mode] - 1U;
+
+  // The Cable Link takes as many consoles as the players option says.
+  if (serial_mode == SERIAL_MODE_SERIAL_CABLE ||
+      serial_mode == SERIAL_MODE_DUAL_CABLE)
+    max_clients = MIN(max_clients, cable_players - 1U);
 
   if (netplay_num_clients >= max_clients)
+    return false;
+
+  // The cable has 4 ends: the frontend numbers its connections, and one that
+  // is busy (ie. a spectator) can push a player past 3, which none of the
+  // cable modes has room for (the real time cable would even take it for
+  // the host).
+  if (maxpl[serial_mode] == MAX_SERMULT_NETPLAYERS &&
+      client_id >= MAX_SERMULT_NETPLAYERS)
     return false;
 
 #ifndef GPSP_INSTANCE_B
@@ -1208,6 +1266,10 @@ static void check_variables(bool started_from_load)
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
       frameskip_interval = strtol(var.value, NULL, 10);
 
+   /* Cable Link players: read every time (it counts from the next netplay
+    * session on). */
+   read_cable_players();
+
    /* (Re)Initialise frame skipping, if required */
    if (started_from_load ||
        (current_frameskip_type != frameskip_type_prev))
@@ -1434,19 +1496,7 @@ bool retro_load_game(const struct retro_game_info* info)
    set_memory_descriptors();
 
 #ifndef GPSP_INSTANCE_B
-   {
-      /* Everything that makes this GBA a different machine: the dual cable
-       * needs the same on both consoles. */
-      u32 i, cfg = 2166136261u;
-      const u32 v[] = { (u32)dynarec_enable, (u32)rtc_mode, (u32)rumble_mode,
-                        (u32)selected_boot_mode, idle_loop_target_pc,
-                        translation_gate_targets };
-      for (i = 0; i < sizeof(v) / sizeof(v[0]); i++)
-         cfg = (cfg ^ v[i]) * 16777619u;
-      for (i = 0; i < translation_gate_targets; i++)
-         cfg = (cfg ^ translation_gate_target_pc[i]) * 16777619u;
-      dual_game_loaded(info->path, cfg);
-   }
+   dual_game_loaded(info->path, dual_machine_cfg());
 #endif
 
    return true;
@@ -1640,6 +1690,10 @@ void retro_run(void)
    bool updated = false;
    unsigned audio_frames = 1;
 
+#ifndef GPSP_INSTANCE_B
+   if (dual_take_boot_reset())
+      cable_boot_pending = true;
+#endif
    if (cable_boot_pending)
    {
       /* A netplay client just plugged the cable */
@@ -1651,6 +1705,13 @@ void retro_run(void)
    if (serial_mode == SERIAL_MODE_SERIAL_CABLE ||
        serial_mode == SERIAL_MODE_DUAL_CABLE)
    {
+      /* The real time cable is plugged once the dual cable is not used
+       * after all (serial_cable.c keeps it unplugged until then). */
+      const bool pending = dual_cable_pending();
+      if (cable_dual_pending && !pending && !dual_running())
+         serialcable_replug();
+      cable_dual_pending = pending;
+
       if (dual_setting_up())
       {
          /* Both GBAs are being set up: the game waits. */

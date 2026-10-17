@@ -1,11 +1,11 @@
 /* Link cable test ROM for the Dual Cable Link.
  *
- * Both GBAs run this. The parent (SI low) starts a multiplayer transfer as
- * soon as the previous one is over (tens of them per frame, more than any
- * real game), the child loads a new word after each one. Every pair of words
- * that crossed the cable is logged in EWRAM, so the two GBAs' logs can be
- * compared, and the words depend on the buttons, so they also tell whether
- * each GBA got its own player's buttons. */
+ * Every GBA (2 to 4) runs this. The parent (SI low) starts a multiplayer
+ * transfer as soon as the previous one is over (tens of them per frame, more
+ * than any real game), each child loads a new word after each one. The four
+ * words that crossed the cable are logged in EWRAM (two log entries per
+ * transfer), so the GBAs' logs can be compared, and the words depend on the
+ * buttons, so they also tell whether each GBA got its own player's buttons. */
 
 #define REG16(a)    (*(volatile unsigned short *)(a))
 #define RCNT        REG16(0x04000134)
@@ -13,6 +13,8 @@
 #define SIOMLT_SEND REG16(0x0400012A)
 #define SIOMULTI0   REG16(0x04000120)
 #define SIOMULTI1   REG16(0x04000122)
+#define SIOMULTI2   REG16(0x04000124)
+#define SIOMULTI3   REG16(0x04000126)
 #define KEYINPUT    REG16(0x04000130)
 
 #define LOG         ((volatile unsigned int *)0x02000010)
@@ -50,18 +52,21 @@ int main(void)
         while (SIOCNT & 0x0080)
           ;
         record(SIOMULTI0 | ((unsigned int)SIOMULTI1 << 16));
+        record(SIOMULTI2 | ((unsigned int)SIOMULTI3 << 16));
         seq++;
       }
     } else {
       /* Child: the next word, then wait for a transfer to come and go. */
-      LOG_ROLE = 2;
-      SIOMLT_SEND = (unsigned short)((seq * 13 + (~KEYINPUT & 0x3FF)) ^ 0x5A5A);
+      LOG_ROLE = 2 + ((c >> 4) & 3) - 1;   /* 2, 3, 4: by its ID */
+      SIOMLT_SEND = (unsigned short)((seq * 13 + (~KEYINPUT & 0x3FF)) ^
+                                     (0x5A5A + LOG_ROLE));
       while (!(SIOCNT & 0x0080))
         if (!(SIOCNT & 0x0004))
           break;            /* became the parent */
       while (SIOCNT & 0x0080)
         ;
       record(SIOMULTI0 | ((unsigned int)SIOMULTI1 << 16));
+      record(SIOMULTI2 | ((unsigned int)SIOMULTI3 << 16));
       seq++;
     }
   }

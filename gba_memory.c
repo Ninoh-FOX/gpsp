@@ -368,6 +368,12 @@ dma_transfer_type dma[4];
 
 u8 *gamepak_buffers[32];    /* Pointers to malloc'ed blocks */
 u32 gamepak_buffer_count;   /* Value between 1 and 32 */
+#ifdef GPSP_INSTANCE_B
+/* Dual Cable Link: the hidden GBAs read the ROM from the player's GBA
+ * (dual.c), which has it all in memory already. These blocks are not ours. */
+static u32 gamepak_shared_mask;
+const u8 *dual_rom_block(u32 idx);
+#endif
 u32 gamepak_size;           /* Size of the ROM in bytes */
 u32 gamepak_file_blocks;    /* Physical payload size in 32KB blocks */
 bool gamepak_mirror_1m;     /* 1MiB Classic NES/Famicom Mini mirror mode */
@@ -2685,8 +2691,16 @@ void memory_term(void)
 
   while (gamepak_buffer_count)
   {
-    free(gamepak_buffers[--gamepak_buffer_count]);
+    --gamepak_buffer_count;
+#ifdef GPSP_INSTANCE_B
+    if (gamepak_shared_mask & (1u << gamepak_buffer_count))
+      continue;
+#endif
+    free(gamepak_buffers[gamepak_buffer_count]);
   }
+#ifdef GPSP_INSTANCE_B
+  gamepak_shared_mask = 0;
+#endif
 
   if (gamepak_mini_rom)
   {
@@ -2707,7 +2721,7 @@ bool memory_check_savestate(const u8 *src)
     "src-addr", "dst-addr", "src-dir", "dst-dir",
     "len", "size", "repeat", "start", "dsc", "irq"
   };
-  int i;
+  int i, j;
   const u8 *memdoc = bson_find_key(src, "memory");
   const u8 *bakdoc = bson_find_key(src, "backup");
   const u8 *dmadoc = bson_find_key(src, "dma");
@@ -2740,8 +2754,9 @@ bool memory_check_savestate(const u8 *src)
     if (!dmastr)
       return false;
 
-    for (i = 0; i < sizeof(dmavars32)/sizeof(dmavars32[0]); i++)
-      if (!bson_contains_key(dmastr, dmavars32[i], BSON_TYPE_INT32))
+    /* (j: i is the channel, every one of them is checked) */
+    for (j = 0; j < sizeof(dmavars32)/sizeof(dmavars32[0]); j++)
+      if (!bson_contains_key(dmastr, dmavars32[j], BSON_TYPE_INT32))
         return false;
   }
   return true;
@@ -2996,6 +3011,19 @@ static s32 load_gamepak_raw(const char *name)
     for (i = 0; i < ldblks; i++)
     {
       // Load 1MB chunk and map it
+#ifdef GPSP_INSTANCE_B
+      // (The first one is always ours: the RTC/rumble registers are
+      // written into it.)
+      if (i && dual_rom_block(i))
+      {
+        if (!(gamepak_shared_mask & (1u << i)))
+          free(gamepak_buffers[i]);
+        gamepak_buffers[i] = (u8*)dual_rom_block(i);
+        gamepak_shared_mask |= 1u << i;
+        filestream_seek(gamepak_file_large, gamepak_buffer_blocksize, SEEK_CUR);
+      }
+      else
+#endif
       {
         u32 read_len = (u32)filestream_read(gamepak_file_large, gamepak_buffers[i], gamepak_buffer_blocksize);
         if (read_len < gamepak_buffer_blocksize)
