@@ -335,8 +335,12 @@ static unsigned hidden_slot(unsigned k) {
 #define DUAL_QSIZE   512
 #define DUAL_REPLIES 64     // Transfers a child's answer is kept for
 
+// A u64 that atomics can use whole: 32 bit x86 aligns u64 to 4 bytes only,
+// and a 64 bit atomic across that boundary is a slow, locked bus split.
+typedef u64 bus_clock __attribute__((aligned(8)));
+
 static struct {
-  u64 pub[NP];                          // Published clocks (atomic)
+  bus_clock pub[NP];                    // Published clocks (atomic)
   unsigned n;
   dual_event q[NP][NP][DUAL_QSIZE];     // Events FOR each slot, FROM each slot
   u32 qhead[NP][NP], qcount[NP][NP];
