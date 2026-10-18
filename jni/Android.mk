@@ -51,7 +51,8 @@ LOCAL_ARM_MODE  := arm
 include $(BUILD_STATIC_LIBRARY)
 GPSP_B_LIB := $(LOCAL_BUILT_MODULE)
 
-GPSP_HIDDEN_DIR := $(TARGET_OBJS)/gpsp_hidden
+# Inside retro_b's object folder, so that "ndk-build clean" removes them too.
+GPSP_HIDDEN_DIR := $(TARGET_OBJS)/retro_b/hidden
 GPSP_HIDDEN     := $(GPSP_HIDDEN_DIR)/gpsp_b.o $(GPSP_HIDDEN_DIR)/gpsp_c.o $(GPSP_HIDDEN_DIR)/gpsp_d.o
 
 $(GPSP_HIDDEN_DIR)/gpsp_hidden.o: $(GPSP_B_LIB)

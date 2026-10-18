@@ -18,6 +18,38 @@ first megabyte).
 Every other mode, and Cable Link when the consoles cannot use the dual
 link, works exactly as before.
 
+## Settings that must match
+
+Each console runs a copy of the others' GBAs, so all of them must be the
+very same machine. If anything here differs, the consoles say **"Cable
+Link: games or settings differ, using the real time cable"** and play over
+the real time cable, which is much slower (every transfer waits for the
+network):
+
+| what | where | note |
+|---|---|---|
+| the game | the ROM file | the very same dump (same CRC): not Europe on one console and USA or Virtual Console on another |
+| BIOS | core option **BIOS** and `system/gba_bios.bin` | with **Auto select** a console uses `gba_bios.bin` if it is in its system folder, and the built-in BIOS if not: either copy the same `gba_bios.bin` to every console, or choose **Builtin BIOS** on all of them |
+| Dynarec | core option **Dynamic Recompiler** | on (or off) everywhere |
+| Sound rate | core option **Sound Output Rate (Hz)** | the same everywhere (the game reads the sound timing) |
+| RTC, Rumble | core options **RTC support**, **Rumble support** | the same everywhere |
+| Cable Link players | core option **Cable Link players** | the same everywhere, or the message is "the consoles have a different number of players" |
+| the core | `gpsp_plus_libretro.so` | the same build on every console (Miyoo Mini, Android, ...) |
+
+Options that only change the picture or the controls (colour correction,
+frame mixing, sprite limit, frameskip, turbo) can differ.
+
+The **Boot mode** option can differ too: the restart that starts a dual
+session always boots through the BIOS (the one the BIOS option gives),
+on every console, and so does a reset while linked. When the session ends
+the boot mode option counts again. Every other mode, and the real time
+cable, follow the options as always.
+
+When the dual link is up every console shows **"Cable Link: both GBAs
+connected (N frames of delay)"** (or "3 GBAs", "4 GBAs"). A local WiFi gives
+2 or 3 frames; netplay through a relay server (tunnel) works but adds the
+relay's delay (about 7 frames with a 80 ms ping).
+
 ## How a session goes
 
 Every console selects **Cable Link** (or **Automatic**, which picks Cable
@@ -25,8 +57,8 @@ Link for every game without a Wireless Adapter, Pokemon or Advance Wars mode
 of its own) and the same number of players, and starts a netplay session
 (host and clients) as usual.
 
-1. Each client compares ROM, BIOS, core version, number of players and the
-   settings that change the machine with the host. If anything differs, the
+1. Each client compares ROM, BIOS, link protocol version, number of
+   players and the settings that change the machine with the host. If anything differs, the
    real time cable is used instead, for everybody, with a message (and each
    client restarts its game then, as games only look for the cable at boot).
    (Which game it is, and the other GBAs, are worked out when the session
@@ -84,6 +116,19 @@ GBAs (`gba_memory.c`), and `libretro.c`.
 
 gives `gpsp_plus_libretro.so` (no LTO here: every GBA must be the very same
 machine code).
+
+Android (every ABI, in `libs/<abi>/libretro.so`; rename it to
+`gpsp_plus_libretro.so`), run from the `jni` folder:
+
+    cd jni && ndk-build
+
+On ARM64 the JIT cache of every GBA must be within 128 MB of the core's
+code. The GBA the player sees maps it when the core starts, with room for
+the hidden GBAs behind it (`memmap.c`): mapped later, when a session starts,
+there is often no room left (Android fills that space with the allocator's
+blocks) and a hidden GBA without its cache would run on the interpreter, out
+of step with its copy on the other console. If one still ends up without it,
+the session uses the real time cable instead.
 
 ## Test without consoles
 

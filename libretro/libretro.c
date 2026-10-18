@@ -127,6 +127,31 @@ static int serial_setting = SERIAL_MODE_AUTO;
 static bool cable_boot_pending = false;    /* Reset the client when the cable gets plugged */
 static unsigned cable_players = 2;         /* GBAs on the Cable Link (2-4) */
 static bool cable_dual_pending = false;    /* Real time cable unplugged meanwhile */
+static bool cable_bios_boot = false;       /* Linked: boot through the BIOS */
+static boot_mode cable_saved_boot;
+
+/* Dual Cable Link only: when the session starts, the linked consoles
+ * restart through their BIOS (gba_bios.bin, or the built-in one, as the
+ * BIOS option says), whatever the boot mode option of each console says:
+ * every GBA of the link then starts the same way. It stays until the
+ * session ends (a reset while linked restarts every GBA the same way);
+ * everywhere else the boot mode option is followed. */
+void cable_force_bios_boot(void)
+{
+   if (!cable_bios_boot)
+      cable_saved_boot = selected_boot_mode;
+   selected_boot_mode = boot_bios;
+   cable_bios_boot    = true;
+}
+
+/* The session is over: the boot mode option counts again. */
+void cable_end_bios_boot(void)
+{
+   if (!cable_bios_boot)
+      return;
+   cable_bios_boot    = false;
+   selected_boot_mode = cable_saved_boot;
+}
 
 u32 idle_loop_target_pc = 0xFFFFFFFF;
 u32 translation_gate_target_pc[MAX_TRANSLATION_GATES];
@@ -557,8 +582,10 @@ static void read_cable_players(void) {
 static u32 dual_machine_cfg(void)
 {
    u32 i, cfg = 2166136261u;
+   /* (Not the boot mode: the link restarts every GBA through the BIOS, see
+    * cable_force_bios_boot. The BIOS itself is compared apart.) */
    const u32 v[] = { (u32)dynarec_enable, (u32)rtc_mode, (u32)rumble_mode,
-                     (u32)selected_boot_mode, idle_loop_target_pc,
+                     idle_loop_target_pc,
                      translation_gate_targets,
                      /* (the sound channels' length and envelope counters,
                       * which the game reads, step at this rate) */
@@ -1169,6 +1196,8 @@ static void check_variables(bool started_from_load)
         else if (!strcmp(var.value, "bios"))
            selected_boot_mode = boot_bios;
      }
+     if (cable_bios_boot)
+        selected_boot_mode = boot_bios;
 
      var.key                = "gpsp_rtc";
      var.value              = 0;
@@ -1404,6 +1433,7 @@ bool retro_load_game(const struct retro_game_info* info)
       return false;
    }
 
+   cable_bios_boot = false;
    check_variables(true);
    set_input_descriptors();
 
@@ -1475,6 +1505,11 @@ bool retro_load_game(const struct retro_game_info* info)
       show_warning_message("Pokemon ROM Hack (M1) detected, forcing built-in BIOS", 2500);
       memcpy(bios_rom, open_gba_bios_rom, sizeof(bios_rom));
    }
+
+#ifdef GPSP_INSTANCE_B
+   /* A hidden GBA of the Cable Link: linked, so as every other GBA there. */
+   cable_force_bios_boot();
+#endif
 
 #ifdef HAVE_DYNAREC
    if (gamepak_mini_materialized && dynarec_enable)

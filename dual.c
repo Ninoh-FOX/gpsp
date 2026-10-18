@@ -134,10 +134,17 @@ static const gba_iface hid_if[DUAL_HIDDEN] = {
   HIDDEN_IFACE(gbab_), HIDDEN_IFACE(gbac_), HIDDEN_IFACE(gbad_)
 };
 
+#if defined(ARM64_ARCH) && defined(HAVE_DYNAREC)
+extern int gbab_dynarec_enable, gbac_dynarec_enable, gbad_dynarec_enable;
+static int *const hid_dynarec[DUAL_HIDDEN] = {
+  &gbab_dynarec_enable, &gbac_dynarec_enable, &gbad_dynarec_enable
+};
+#endif
+
 /* ---- protocol ------------------------------------------------------------- */
 
 #define DUAL_HEADER        0x4d434431   // MCD1 (Multiplayer Cable, Dual)
-#define DUAL_VERSION       4
+#define DUAL_VERSION       5
 
 // Packets: header, type | sender's slot << 8 (FF: none yet), words, data.
 #define DPK_HELLO          1   // version, rom, bios, settings, players, host
@@ -586,6 +593,16 @@ static bool b_load(unsigned k) {
     g->deinit();
     return false;
   }
+#if defined(ARM64_ARCH) && defined(HAVE_DYNAREC)
+  // Without its JIT cache (see memmap.c) a hidden GBA would run on the
+  // interpreter, whose timing is not that of its copy on the other console:
+  // the real time cable is better than GBAs that drift apart.
+  if (dynarec_enable && !*hid_dynarec[k]) {
+    g->unload_game();
+    g->deinit();
+    return false;
+  }
+#endif
 
   if (!ds.hid[k].th_ok) {
     sem_init(&ds.hid[k].start, 0, 0);
@@ -745,6 +762,7 @@ static void dual_stop(const char *why) {
 
   ds.state = DS_OFF;
   dual_free_blobs();
+  cable_end_bios_boot();
   if (ds.loaded) {
     dualport_end();
     rtc_dual_end();
@@ -884,6 +902,7 @@ static bool dual_capture(void) {
   if (!ds.own_blob || !ds.own_pack)
     return false;
 
+  cable_force_bios_boot();
   reset_gba();
   rtc_dual_begin(true);
   memset(ds.own_blob, 0, GBA_STATE_MEM_SIZE);

@@ -77,6 +77,12 @@ int dualbus_wait_reply(unsigned slot, unsigned from_slot, uint32_t seq,
 #include <stdbool.h>
 #include <stddef.h>
 #include "libretro.h"
+// libretro.c: a boot through the BIOS for the restart that starts a dual
+// session and while it lasts (every linked GBA restarts so, whatever the
+// boot mode option of each console says); back to the option when it ends.
+void cable_force_bios_boot(void);
+void cable_end_bios_boot(void);
+
 void dual_set_frontend(retro_environment_t cb,
                        void (*message)(const char *text, unsigned ms));
 void dual_game_loaded(const char *path, uint32_t cfg);
