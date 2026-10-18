@@ -45,6 +45,13 @@ on every console, and so does a reset while linked. When the session ends
 the boot mode option counts again. Every other mode, and the real time
 cable, follow the options as always.
 
+**Dynamic Recompiler** and **Sound Output Rate** changed in the menu while
+the consoles are linked (or waiting for the players) do not apply at once:
+the copies of this GBA on the other consoles could not follow, and the link
+would break ("the consoles went out of sync"). The core says "the change
+will be applied when the link ends" and applies it then. (For the next
+session it must be the same on every console again, see the table.)
+
 When the dual link is up every console shows **"Cable Link: both GBAs
 connected (N frames of delay)"** (or "3 GBAs", "4 GBAs"). A local WiFi gives
 2 or 3 frames; netplay through a relay server (tunnel) works but adds the

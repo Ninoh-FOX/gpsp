@@ -763,13 +763,17 @@ static void dual_stop(const char *why) {
   ds.state = DS_OFF;
   dual_free_blobs();
   cable_end_bios_boot();
+  // The clocks go back to normal even if the setup did not get to the end:
+  // ours took the session time when the game restarted (dual_capture), the
+  // hidden GBAs when their state came in.
+  rtc_dual_end();
+  for (k = 0; k < DUAL_HIDDEN; k++)
+    if (ds.hid[k].loaded)
+      hid_if[k].rtc_end();
   if (ds.loaded) {
     dualport_end();
-    rtc_dual_end();
-    for (k = 0; k + 1 < ds.n; k++) {
+    for (k = 0; k + 1 < ds.n; k++)
       hid_if[k].port_end();
-      hid_if[k].rtc_end();
-    }
     serial_mode = SERIAL_MODE_SERIAL_CABLE;
     serialcable_session_reset();
     ds.loaded = false;

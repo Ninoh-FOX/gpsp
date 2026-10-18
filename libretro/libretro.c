@@ -1126,12 +1126,37 @@ static void extract_directory(char* buf, const char* path, size_t size)
       strlcpy(buf, ".", size);
 }
 
+#ifndef GPSP_INSTANCE_B
+/* Dual Cable Link: the other consoles run copies of this GBA, made with the
+ * settings it had when the session started (dual_machine_cfg). A change to
+ * one of those in the menu while linked would make this GBA another machine
+ * than its copies: it waits until the session is over. */
+static bool cable_opts_held = false;
+
+static bool cable_linked(void)
+{
+   return dual_running() || dual_cable_pending();
+}
+
+static void cable_hold_option(void)
+{
+   if (!cable_opts_held)
+      show_warning_message("Cable Link: the change will be applied when the link ends", 3000);
+   cable_opts_held = true;
+}
+#endif
+
 static void check_variables(bool started_from_load)
 {
    struct retro_variable var;
    bool frameskip_type_prev;
    bool post_process_cc_prev;
    bool post_process_mix_prev;
+   bool linked = false;
+
+#ifndef GPSP_INSTANCE_B
+   linked = !started_from_load && cable_linked();
+#endif
 
 #ifdef HAVE_DYNAREC
    var.key = "gpsp_drc";
@@ -1140,16 +1165,24 @@ static void check_variables(bool started_from_load)
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
       int prevvalue = dynarec_enable;
+      int value = prevvalue;
       if (strcmp(var.value, "disabled") == 0)
-         dynarec_enable = 0;
+         value = 0;
       else if (strcmp(var.value, "enabled") == 0)
-         dynarec_enable = 1;
+         value = 1;
+
+#ifndef GPSP_INSTANCE_B
+      if (linked && value != prevvalue)
+         cable_hold_option();
+      else
+#endif
+         dynarec_enable = value;
 
       /* Flush dynarec cache to ensure we do not execute old code */
       if (dynarec_enable != prevvalue)
          flush_dynarec_caches();
    }
-   else
+   else if (!linked)
       dynarec_enable = 1;
 
 #if defined(MMAP_JIT_CACHE)
@@ -1260,6 +1293,12 @@ static void check_variables(bool started_from_load)
       static int sound_rate_configured = 0;
       struct retro_variable svar = { "gpsp_sound_rate", NULL };
       environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &svar);
+#ifndef GPSP_INSTANCE_B
+      /* (the length and envelope counters the game reads step at this rate) */
+      if (linked && ((svar.value && !strcmp(svar.value, "32768")) ? 15u : 16u) != sound_freq_bits)
+         cable_hold_option();
+      else
+#endif
       gpsp_apply_sound_rate(svar.value, sound_rate_configured ? environ_cb : NULL);
       sound_rate_configured = 1;
    }
@@ -1434,6 +1473,9 @@ bool retro_load_game(const struct retro_game_info* info)
    }
 
    cable_bios_boot = false;
+#ifndef GPSP_INSTANCE_B
+   cable_opts_held = false;
+#endif
    check_variables(true);
    set_input_descriptors();
 
@@ -1728,6 +1770,12 @@ void retro_run(void)
 #ifndef GPSP_INSTANCE_B
    if (dual_take_boot_reset())
       cable_boot_pending = true;
+   /* The link is over: the options changed meanwhile apply now. */
+   if (cable_opts_held && !cable_linked())
+   {
+      cable_opts_held = false;
+      check_variables(false);
+   }
 #endif
    if (cable_boot_pending)
    {

@@ -190,15 +190,22 @@ static void net_poll(int who) {
 /* HOST_PLAYERS_BEFORE=n: the players option the host had before the netplay
  * session (it is changed to PLAYERS in the menu right before connecting). */
 static bool opt_netplay;
+/* CHANGE_AT=n: at frame n of each session console 0 switches its sound rate
+ * (32768 Hz) in the menu, or its dynarec off with CHANGE_DRC=1, and the core
+ * is told an option changed. */
+static bool opt_changed, opt_change_pending;
 
 static const char *opt(int who, const char *key) {
   if (!strcmp(key, "gpsp_serial")) return getenv("SERIAL") ? getenv("SERIAL") : "mul_cable";
   if (!strcmp(key, "gpsp_bios")) return "builtin";
   if (!strcmp(key, "gpsp_boot_mode")) return "game";
-  if (!strcmp(key, "gpsp_drc")) return "enabled";
+  /* (CHANGE_DRC=1: what CHANGE_AT changes is the dynarec, turned off) */
+  if (!strcmp(key, "gpsp_drc"))
+    return who == 0 && opt_changed && getenv("CHANGE_DRC") ? "disabled" : "enabled";
   if (!strcmp(key, "gpsp_frameskip")) return "disabled";
   /* SOUND1=32768: console 1 has another sound rate (a setting that differs) */
   if (!strcmp(key, "gpsp_sound_rate") && who == 1 && getenv("SOUND1")) return getenv("SOUND1");
+  if (!strcmp(key, "gpsp_sound_rate") && who == 0 && opt_changed && !getenv("CHANGE_DRC")) return "32768";
   /* SOUND=32768: the sound rate of every console */
   if (!strcmp(key, "gpsp_sound_rate") && getenv("SOUND")) return getenv("SOUND");
   if (!strcmp(key, "gpsp_cable_players")) {
@@ -253,7 +260,8 @@ static bool env(int who, unsigned cmd, void *data) {
     *(unsigned *)data = 1;
     return true;
   case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE:
-    *(bool *)data = false;
+    *(bool *)data = who == 0 && opt_change_pending;
+    if (who == 0) opt_change_pending = false;
     return true;
   default:
     return false;
@@ -527,7 +535,8 @@ int main(int argc, char **argv) {
 
   /* One file each: dlopen gives each its own globals. */
   for (i = 0; i < ncon; i++) {
-    snprintf(copy[i], sizeof(copy[i]), "/tmp/dualtest_core%d_%d.so", i, (int)getpid());
+    snprintf(copy[i], sizeof(copy[i]), "%s/dualtest_core%d_%d.so",
+             getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", i, (int)getpid());
     if (!copy_file(core, copy[i])) { fprintf(stderr, "cannot copy the core\n"); return 2; }
     printf("console %d: loading core\n", i);
     load_core(&con[i], copy[i], i);
@@ -548,6 +557,20 @@ int main(int argc, char **argv) {
     }
   printf("solo frames done (%u)\n", solo);
 
+  /* SESSIONS=n: n netplay sessions one after the other (everybody leaves,
+   * plays alone a while, and connects again). */
+  {
+  const unsigned sessions = getenv("SESSIONS") ? (unsigned)atoi(getenv("SESSIONS")) : 1;
+  unsigned sess;
+  for (sess = 0; sess < sessions; sess++) {
+  if (sess) {
+    printf("=== session %u ===\n", sess + 1);
+    for (f = 0; f < solo; f++)
+      for (i = 0; i < ncon; i++) {
+        con[i].keys = script_keys(i, f + 1000 * i);
+        con[i].run();
+      }
+  }
   /* Netplay: the host starts, the clients join one after the other. */
   {
     const unsigned gap = getenv("JOIN_GAP") ? (unsigned)atoi(getenv("JOIN_GAP")) : 0;
@@ -621,7 +644,14 @@ int main(int argc, char **argv) {
     unsigned rounds = 0;
     const int64_t limit = t0 + 120 * 1000000LL + (int64_t)frames * 100000 * ncon;
     const unsigned reset_at = getenv("RESET_AT") ? (unsigned)atoi(getenv("RESET_AT")) : 0;
+    const unsigned change_at = getenv("CHANGE_AT") ? (unsigned)atoi(getenv("CHANGE_AT")) : 0;
+    bool changed = false;
     while (!all_done(frames) && now_us() < limit) {
+      if (change_at && !changed && con[0].frames_shown >= change_at) {
+        printf("console 0 changes its sound rate at frame %u\n", con[0].frames_shown);
+        opt_changed = !opt_changed;
+        opt_change_pending = changed = true;
+      }
       if (reset_at && con[0].frames_shown == reset_at) {
         printf("host presses reset at frame %u\n", reset_at);
         con[0].reset();
@@ -687,6 +717,27 @@ int main(int argc, char **argv) {
       if (n < 20 || diff || phantom || absent > n / 20)
         ok = 0;
     }
+  }
+
+  /* Everybody leaves (the clients first, as the host hears about each). */
+  if (sess + 1 < sessions) {
+    pkt *p;
+    for (i = 1; i < ncon; i++) {
+      if (con[i].np_set && con[i].np.stop) con[i].np.stop();
+      con[i].started = con[i].playing = false;
+      if (con[0].np.disconnected) con[0].np.disconnected((uint16_t)i);
+    }
+    if (con[0].np.stop) con[0].np.stop();
+    con[0].started = false;
+    pthread_mutex_lock(&q_mtx);
+    while ((p = q_head)) { q_head = p->next; free(p); }
+    q_tail = NULL;
+    pthread_mutex_unlock(&q_mtx);
+    opt_netplay = false;
+    printf("session %u: %s\n", sess + 1, ok ? "ok" : "FAILED");
+    if (!ok) break;
+  }
+  }
   }
 
   for (i = 0; i < ncon; i++) {
