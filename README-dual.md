@@ -82,7 +82,10 @@ of its own) and the same number of players, and starts a netplay session
    keeps their own save. The host is player 1, the clients follow in the
    order they came.
 5. From then on only the buttons are sent. Every 2 seconds the consoles
-   compare all the GBAs; if they ever differ the link is cut with a message.
+   compare all the GBAs; if they differ in two checks in a row the link is
+   cut with a message. (Consoles of different kinds, such as a Miyoo Mini
+   and an Android phone, can differ for a moment in CPU flags that nothing
+   reads; a GBA that really went another way stays different.)
 6. Every console shows the same frame at the same time (screen and sound go
    together): with the buttons each one says how far ahead it is, and one
    that is ahead holds a frame (a frame of silence) when it gets more than
@@ -171,3 +174,14 @@ whose cable prints what it does; `DUAL_FAULT=1` with it gives a hidden GBA
 other buttons once, to check that the agreement check catches it.
 `SERIAL=auto` (or any other value of the option) changes the link mode,
 `ROM2=...` gives client 1 another game (the real time cable must take over).
+`BIOSDIR=dir` uses the official BIOS (`dir/gba_bios.bin`), `SAV0=file`
+(`SAV1`...) loads a console's save memory and `SAVEOUT=dir` writes them
+at the end.
+
+Consoles of different kinds (Miyoo Mini: ARM32 dynarec, Android: ARM64)
+run copies of each other's GBA, so every dynarec must give the very same
+machine, cycle for cycle. `tools/dualtest/dettest.c` runs a core alone
+with scripted buttons and prints a hash of the machine every frame: build
+it for each CPU, run the same game and buttons on each core (`qemu-arm`,
+`qemu-aarch64`, native) and compare the outputs. (The interpreter has other
+timings: the dynarec setting must match, see the table above.)

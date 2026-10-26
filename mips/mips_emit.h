@@ -1893,7 +1893,11 @@ u32 execute_store_cpsr_body(u32 _cpsr, u32 address)
    block_exits[block_exit_position].branch_target);                           \
   block_exit_position++                                                       \
 
+/* Div and DivArm cost as on the ARM32 dynarec (11 + 32 and 14 + 32 cycles
+ * on top of the 64 the translator adds): a GBA copied to another console by
+ * the Dual Cable Link must keep the very same timing on every backend. */
 #define arm_hle_div(cpu_mode)                                                 \
+  cycle_count += 11 + 32;                                                     \
   mips_emit_div(reg_r0, reg_r1);                                              \
   mips_emit_mflo(reg_r0);                                                     \
   mips_emit_mfhi(reg_r1);                                                     \
@@ -1902,6 +1906,7 @@ u32 execute_store_cpsr_body(u32 _cpsr, u32 address)
   mips_emit_subu(reg_r3, reg_r3, reg_a0);                                     \
 
 #define arm_hle_div_arm(cpu_mode)                                             \
+  cycle_count += 14 + 32;                                                     \
   mips_emit_div(reg_r1, reg_r0);                                              \
   mips_emit_mflo(reg_r0);                                                     \
   mips_emit_mfhi(reg_r1);                                                     \

@@ -2544,6 +2544,179 @@ static u32 evict_gamepak_page(void)
   return ret;
 }
 
+/* Nintendo Switch Online builds of Pokemon FireRed/LeafGreen (header
+ * revision 10, every language). Their emulator ("Sloop") handles extra
+ * software interrupts, svc 0x40-0x62 (pret/pokefirered src/sloopsvc.c): the
+ * wireless adapter goes through it, saves are handed to it sector by sector
+ * instead of being written to the flash chip, names are run through a bad
+ * word filter... On a GBA those calls do not exist: the game hangs on a white
+ * screen, keeps a default name and never saves.
+ *
+ * The calls all live in one block of small wrappers. When the ROM is loaded
+ * each one is patched (in memory) to what it gives with no network: saves
+ * call the game's own flash routine (ProgramFlashSectorAndVerify, still in
+ * the ROM for the Trainer Tower), the filter keeps the name, parental
+ * controls allow everything, the wireless state reads "nothing", the rest
+ * does nothing. Patches are halfwords at ROM offsets, applied again to any
+ * ROM page that is read back from the file. */
+#define ROM_PATCHES_MAX 64
+static struct { u32 offset; u16 value; } rom_patches[ROM_PATCHES_MAX];
+static u32 rom_patch_count;
+
+static void rom_patches_apply(u32 physical_index, u8 *page)
+{
+  u32 i;
+  for (i = 0; i < rom_patch_count; i++)
+    if ((rom_patches[i].offset >> 15) == physical_index)
+    {
+      u8 *p = &page[rom_patches[i].offset & 0x7FFF];
+      // (Hidden Dual Cable Link GBAs share ROM blocks: write only if needed)
+      if (p[0] != (rom_patches[i].value & 0xFF) || p[1] != (rom_patches[i].value >> 8))
+      {
+        p[0] = rom_patches[i].value & 0xFF;
+        p[1] = rom_patches[i].value >> 8;
+      }
+    }
+}
+
+static void rom_patch16(u32 offset, u16 value)
+{
+  if (rom_patch_count < ROM_PATCHES_MAX)
+  {
+    rom_patches[rom_patch_count].offset = offset;
+    rom_patches[rom_patch_count].value = value;
+    rom_patch_count++;
+  }
+}
+
+static u16 thumb_bl_hi(u32 from, u32 to)
+{
+  return 0xF000 | (((s32)(to - (from + 4)) >> 12) & 0x7FF);
+}
+
+static u16 thumb_bl_lo(u32 from, u32 to)
+{
+  return 0xF800 | (((s32)(to - (from + 4)) >> 1) & 0x7FF);
+}
+
+/* The ROM as loaded (right after load_gamepak_raw, the first megabytes are
+ * in gamepak_buffers in order). */
+static const u8 *rom_loaded_ptr(u32 offset, u32 len)
+{
+  u32 loaded = gamepak_buffer_count * gamepak_buffer_blocksize;
+  if (loaded > gamepak_size)
+    loaded = gamepak_size;
+  if (gamepak_mini_materialized || offset + len > loaded ||
+      (offset >> 20) != ((offset + len - 1) >> 20))
+    return NULL;
+  return &gamepak_buffers[offset >> 20][offset & 0xFFFFF];
+}
+
+static s32 rom_find(const u8 *pat, u32 len, u32 from, u32 to)
+{
+  u32 o;
+  for (o = from; o + len <= to; o += 2)
+  {
+    const u8 *p = rom_loaded_ptr(o, len);
+    if (p && !memcmp(p, pat, len))
+      return (s32)o;
+  }
+  return -1;
+}
+
+static u16 rom_read16(u32 offset)
+{
+  const u8 *p = rom_loaded_ptr(offset, 2);
+  return p ? (u16)(p[0] | (p[1] << 8)) : 0;
+}
+
+static void sloop_patch_rom(void)
+{
+  // svc 0x40; bx lr; svc 0x41; bx lr: the start of the wrapper block
+  static const u8 block_sig[] = { 0x40, 0xDF, 0x70, 0x47, 0x41, 0xDF, 0x70, 0x47 };
+  // ProgramFlashSectorAndVerify, up to its first call
+  static const u8 flash_sig[] = {
+    0x70, 0xB5, 0x0D, 0x1C, 0x00, 0x04, 0x04, 0x0C, 0x00, 0x26, 0x02, 0xE0,
+    0x70, 0x1C, 0x00, 0x06, 0x06, 0x0E, 0x02, 0x2E, 0x10, 0xD8 };
+  // The VBlank wait in main.c: ldrh; adds; ands; cmp; beq (idle loop)
+  static const u8 idle_sig[] = {
+    0x91, 0x8B, 0x18, 0x1C, 0x08, 0x40, 0x00, 0x28, 0xFA, 0xD0 };
+  const u8 *hdr = rom_loaded_ptr(0, 0xC0);
+  s32 block, flash, idle;
+  u32 o, patched = 0;
+
+  if (!hdr || hdr[0xBC] != 0x0A ||
+      (memcmp(&hdr[0xA0], "POKEMON FIRE", 12) && memcmp(&hdr[0xA0], "POKEMON LEAF", 12)))
+    return;
+
+  block = rom_find(block_sig, sizeof(block_sig), 0, 0x100000);
+  flash = rom_find(flash_sig, sizeof(flash_sig), 0, 0x400000);
+  if (block < 0 || flash < 0)
+    return;
+
+  for (o = (u32)block; o < (u32)block + 0x200; o += 2)
+  {
+    const u16 op = rom_read16(o);
+    u32 svc, start;
+    if ((op & 0xFF00) != 0xDF00 || (op & 0xFF) < 0x40 || (op & 0xFF) > 0x6F)
+      continue;
+    svc = op & 0xFF;
+    switch (svc)
+    {
+      case 0x48:    // Write a save sector
+      case 0x56:    // Replace a save sector
+      case 0x4D:    // Bad word check (returns 0: the name is kept as is)
+        // The wrapper starts with a push {..., lr}, a few bytes before
+        for (start = o - 2; start + 0x20 > o; start -= 2)
+          if ((rom_read16(start) & 0xFF00) == 0xB500)
+            break;
+        if (start + 0x20 <= o)
+        {
+          rom_patch_count = 0;    // Not the layout we know: leave it alone
+          return;
+        }
+        if (svc == 0x4D)
+        {
+          rom_patch16(start, 0x2000);       // movs r0, #0
+          rom_patch16(start + 2, 0x4770);   // bx lr
+        }
+        else
+        {
+          // ProgramFlashSectorAndVerify(sector, data)
+          const u32 at = 0x8000000 + start + 2, to = 0x8000000 + (u32)flash;
+          rom_patch16(start, 0xB500);                   // push {lr}
+          rom_patch16(start + 2, thumb_bl_hi(at, to));  // bl
+          rom_patch16(start + 4, thumb_bl_lo(at, to));
+          rom_patch16(start + 6, 0xBC01);               // pop {r0}
+          rom_patch16(start + 8, 0x4700);               // bx r0
+        }
+        break;
+      case 0x54:    // Communication allowed by parental controls
+        rom_patch16(o, 0x2001);   // movs r0, #1
+        break;
+      case 0x49: case 0x4A: case 0x4B: case 0x50: case 0x51: case 0x53:
+        rom_patch16(o, 0x2000);   // movs r0, #0: no network, nothing to do
+        break;
+      default:      // Notifications for the emulator
+        rom_patch16(o, 0x46C0);   // nop
+        break;
+    }
+    patched++;
+  }
+
+  // The idle loop of these builds is not where the cartridge one is.
+  idle = rom_find(idle_sig, sizeof(idle_sig), 0x200, 0x2000);
+  idle_loop_target_pc = idle >= 0 ? 0x8000000 + (u32)idle + 8 : 0xFFFFFFFF;
+
+  for (o = 0; o < gamepak_buffer_count && o * gamepak_buffer_blocksize < gamepak_size; o++)
+  {
+    u32 j;
+    for (j = 0; j < 32; j++)
+      rom_patches_apply(o * 32 + j, &gamepak_buffers[o][32 * 1024 * j]);
+  }
+  printf("Switch Online build: %u system calls patched\n", (unsigned)patched);
+}
+
 u8 *load_gamepak_page(u32 physical_index)
 {
   u32 rom_blocks = gamepak_size >> 15;
@@ -2573,6 +2746,7 @@ u8 *load_gamepak_page(u32 physical_index)
     if (read_len < (32 * 1024))
       memset(swap_location + read_len, 0xFF, (32 * 1024) - read_len);
   }
+  rom_patches_apply(physical_index, swap_location);
 
   // Map it to the read handlers now
   map_rom_entry(read, physical_index, swap_location, rom_blocks);
@@ -3256,6 +3430,9 @@ u32 load_gamepak(const struct retro_game_info* info, const char *name,
    serial_mode = force_serial;
 
    load_game_config_over(game_code);
+
+   rom_patch_count = 0;
+   sloop_patch_rom();
 
    if (backup_type_reset == BACKUP_UNKN)
    {

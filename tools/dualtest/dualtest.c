@@ -24,7 +24,10 @@
  * KEYS0..KEYS3 = "from-to:key+key;...": what each player presses at those
  * frames of the session (keys: a b select start up down left right l r),
  * instead of random buttons. SHOTS=dir saves the screens (dir/cN_FRAME.ppm)
- * at the frames in SHOT_AT="f,f,..." or every SHOT_EVERY frames. With PACE
+ * at the frames in SHOT_AT="f,f,..." or every SHOT_EVERY frames. SAVn=file
+ * loads console n's save memory, SAVEOUT=dir writes them (dir/cN.sav) at
+ * the end. BIOSDIR=dir: official BIOS (dir/gba_bios.bin) instead of the
+ * built-in one. With PACE
  * the harness prints how long the setup took and how many frames apart the
  * screens are.
  *
@@ -197,7 +200,8 @@ static bool opt_changed, opt_change_pending;
 
 static const char *opt(int who, const char *key) {
   if (!strcmp(key, "gpsp_serial")) return getenv("SERIAL") ? getenv("SERIAL") : "mul_cable";
-  if (!strcmp(key, "gpsp_bios")) return "builtin";
+  /* BIOSDIR=dir: the official BIOS, dir/gba_bios.bin */
+  if (!strcmp(key, "gpsp_bios")) return getenv("BIOSDIR") ? "official" : "builtin";
   if (!strcmp(key, "gpsp_boot_mode")) return "game";
   /* (CHANGE_DRC=1: what CHANGE_AT changes is the dynarec, turned off) */
   if (!strcmp(key, "gpsp_drc"))
@@ -224,6 +228,8 @@ static bool env(int who, unsigned cmd, void *data) {
     return v->value != NULL;
   }
   case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY:
+    *(const char **)data = getenv("BIOSDIR") ? getenv("BIOSDIR") : ".";
+    return true;
   case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
     *(const char **)data = ".";
     return true;
@@ -546,6 +552,19 @@ int main(int argc, char **argv) {
     info.path = (i == 1 && getenv("ROM2")) ? getenv("ROM2") : rom;
     if (!con[i].load_game(&info)) { fprintf(stderr, "load_game failed\n"); return 2; }
     if (!con[i].np_set) { fprintf(stderr, "no netpacket interface\n"); return 2; }
+    /* SAVn=file: its save memory, loaded as RetroArch does. */
+    {
+      char var[8];
+      const char *sav;
+      snprintf(var, sizeof(var), "SAV%d", i);
+      if ((sav = getenv(var))) {
+        FILE *fp = fopen(sav, "rb");
+        unsigned char *m = con[i].get_memory_data(RETRO_MEMORY_SAVE_RAM);
+        size_t got = 0;
+        if (fp && m) { got = fread(m, 1, 1024 * 128, fp); fclose(fp); }
+        printf("console %d: save %s, %u bytes\n", i, sav, (unsigned)got);
+      }
+    }
     printf("console %d: ready\n", i);
   }
 
@@ -740,6 +759,15 @@ int main(int argc, char **argv) {
   }
   }
 
+  /* SAVEOUT=dir: each console's save memory, as dir/cN.sav. */
+  if (getenv("SAVEOUT"))
+    for (i = 0; i < ncon; i++) {
+      char path[512];
+      const unsigned char *m = con[i].get_memory_data(RETRO_MEMORY_SAVE_RAM);
+      FILE *fp;
+      snprintf(path, sizeof(path), "%s/c%d.sav", getenv("SAVEOUT"), i);
+      if (m && (fp = fopen(path, "wb"))) { fwrite(m, 1, 1024 * 128, fp); fclose(fp); }
+    }
   for (i = 0; i < ncon; i++) {
     if (con[i].np_set && con[i].np.stop) con[i].np.stop();
     con[i].unload_game();

@@ -273,6 +273,8 @@ static struct {
   // Agreement checks: [frame + 1, each slot's GBA], ours and each slot's
   u32 my_hash[DUAL_HASH_SLOTS][1 + NP];
   u32 peer_hash[NP][DUAL_HASH_SLOTS][1 + NP];
+  u32 hash_done[NP];            // Last check made with each slot (frame + 1)
+  u32 hash_bad[NP];             // Last one that differed (frame + 1)
 
   // Time sync. Where each peer is: from each INPUT, its frame (in us) at our
   // time 0; the best of the last ones is the least late.
@@ -996,6 +998,8 @@ static void dual_session_reset(void) {
   memset(ds.frame_ok, 0, sizeof(ds.frame_ok));
   memset(ds.my_hash, 0, sizeof(ds.my_hash));
   memset(ds.peer_hash, 0, sizeof(ds.peer_hash));
+  memset(ds.hash_done, 0, sizeof(ds.hash_done));
+  memset(ds.hash_bad, 0, sizeof(ds.hash_bad));
   memset(ds.peer_pos_n, 0, sizeof(ds.peer_pos_n));
   memset(ds.peer_lead, 0, sizeof(ds.peer_lead));
   for (s = 0; s < NP; s++) {
@@ -1502,6 +1506,12 @@ void dual_b_frame_wait(void) {
 }
 
 // Every copy of every GBA must be the same: compare once each one told.
+// The link is cut when two checks in a row differ. Consoles of different
+// kinds (ARM32 Miyoo Mini, ARM64 Android...) can disagree for a moment on
+// values nothing reads: the CPU flags an instruction left unused (each
+// dynarec computes only the ones it needs), which an interrupt can also
+// push on the stack. Those are gone by the next check; a GBA that really
+// went another way stays different.
 static void dual_check_hash(u32 f) {
   const u32 i = (f / DUAL_HASH_EVERY) % DUAL_HASH_SLOTS;
   const u32 *mine = ds.my_hash[i];
@@ -1510,14 +1520,20 @@ static void dual_check_hash(u32 f) {
     return;
   for (s = 0; s < ds.n; s++) {
     const u32 *theirs = ds.peer_hash[s][i];
-    if (s == ds.my_slot || theirs[0] != f + 1)
+    if (s == ds.my_slot || theirs[0] != f + 1 || ds.hash_done[s] >= f + 1)
       continue;
+    ds.hash_done[s] = f + 1;
     for (g = 0; g < ds.n; g++)
-      if (mine[1 + g] != theirs[1 + g]) {
-        dual_send_all(DPK_BYE, NULL, 0, NULL, 0);
-        dual_stop("Cable Link: the consoles went out of sync");
-        return;
-      }
+      if (mine[1 + g] != theirs[1 + g])
+        break;
+    if (g == ds.n)
+      continue;
+    if (f >= DUAL_HASH_EVERY && ds.hash_bad[s] == f + 1 - DUAL_HASH_EVERY) {
+      dual_send_all(DPK_BYE, NULL, 0, NULL, 0);
+      dual_stop("Cable Link: the consoles went out of sync");
+      return;
+    }
+    ds.hash_bad[s] = f + 1;
   }
 }
 

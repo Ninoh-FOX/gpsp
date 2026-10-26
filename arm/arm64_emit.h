@@ -1394,9 +1394,11 @@ u32 execute_store_cpsr_body(u32 _cpsr, u32 address, u32 store_mask)
 #define arm_block_memory_final_load(writeback_type)                           \
   arm_block_memory_load()                                                     \
 
+/* (The last register stored can be the PC: it stores the STM's address + 12,
+   as the ARM32 and x86 dynarecs do.) */
 #define arm_block_memory_final_store(writeback_type)                          \
   generate_load_pc(reg_a2, (pc + 4));                                         \
-  generate_load_reg(reg_a1, i)                                                \
+  generate_load_reg_pc(reg_a1, i, 12);                                        \
   arm_block_memory_writeback_post_store(writeback_type);                      \
   generate_function_call(execute_store_u32);                                  \
 
@@ -1870,7 +1872,11 @@ u32 execute_store_cpsr_body(u32 _cpsr, u32 address, u32 store_mask)
    block_exits[block_exit_position].branch_target);                           \
   block_exit_position++                                                       \
 
+/* Div and DivArm cost as on the ARM32 dynarec (11 + 32 and 14 + 32 cycles
+ * on top of the 64 the translator adds): a GBA copied to another console by
+ * the Dual Cable Link must keep the very same timing on every backend. */
 #define arm_hle_div(cpu_mode)                                                 \
+  cycle_count += 11 + 32;                                                     \
   aa64_emit_sdiv(reg_r3, reg_r0, reg_r1);                                     \
   aa64_emit_msub(reg_r1, reg_r0, reg_r1, reg_r3);                             \
   aa64_emit_mov(reg_r0, reg_r3);                                              \
@@ -1878,6 +1884,7 @@ u32 execute_store_cpsr_body(u32 _cpsr, u32 address, u32 store_mask)
   aa64_emit_csneg(reg_r3, reg_r3, reg_r3, ccode_ge);                          \
 
 #define arm_hle_div_arm(cpu_mode)                                             \
+  cycle_count += 14 + 32;                                                     \
   aa64_emit_sdiv(reg_r3, reg_r1, reg_r0);                                     \
   aa64_emit_msub(reg_r1, reg_r1, reg_r0, reg_r3);                             \
   aa64_emit_mov(reg_r0, reg_r3);                                              \

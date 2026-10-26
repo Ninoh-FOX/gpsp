@@ -2281,9 +2281,13 @@ static void function_cc execute_swi(u32 pc)
    block_exits[block_exit_position].branch_target);                           \
   block_exit_position++                                                       \
 
+/* Div and DivArm cost as on the ARM32 dynarec (11 + 32 and 14 + 32 cycles
+ * on top of the 64 the translator adds): a GBA copied to another console by
+ * the Dual Cable Link must keep the very same timing on every backend. */
 #define arm_hle_div(cpu_mode)                                                 \
 {                                                                             \
   u8 *jmpinst, *jmpneg, *jmpdone;                                             \
+  cycle_count += 11 + 32;                                                     \
   generate_load_reg(a0, 0);                                                   \
   generate_load_reg(a2, 1);                                                   \
   generate_cmp_imm(a2, 0);                                                    \
@@ -2313,6 +2317,7 @@ static void function_cc execute_swi(u32 pc)
 #define arm_hle_div_arm(cpu_mode)                                             \
 {                                                                             \
   u8 *jmpinst, *jmpneg, *jmpdone;                                             \
+  cycle_count += 14 + 32;                                                     \
   generate_load_reg(a0, 1);                                                   \
   generate_load_reg(a2, 0);                                                   \
   generate_cmp_imm(a2, 0);                                                    \
