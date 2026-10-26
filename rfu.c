@@ -24,6 +24,23 @@
 // only 4 slots the extra ones were dropped.
 #define RFU_PKT_QUEUE_SIZE 16
 
+// The host's queues are for bursts, not a standing delay. The host's game
+// reads one packet per client each exchange, and a client answers each
+// exchange with one packet: when an answer came too late for its exchange
+// (the host saw none) it stays queued for good, and from then on every packet
+// of that client is read an exchange late. TCP bursts piled that up to the 16
+// slots: the client's trainer took ages to move in the Pokemon link rooms
+// (and a full queue drops packets: link error).
+// A packet with data is never dropped: games number them (Pokemon cuts the
+// link after a few missing ones). But an answer with no command in it is all
+// zero after its 2 byte header (librfu UNI frame, which the game ignores). If
+// the queue of a client never went below RFU_PKT_STALE_MIN packets during
+// RFU_PKT_STALE_READS reads, that many packets minus one are owed, and are
+// taken from the empty ones as they come to the front (never the last one in
+// the queue: the host still gets an answer from that client).
+#define RFU_PKT_STALE_READS 60
+#define RFU_PKT_STALE_MIN    2
+
 // While the game waits for an event the network is read every this many
 // cycles (~68 times per frame, 0.24ms), not on every scheduler event: each
 // read is a system call, and there are hundreds of events per frame.
@@ -146,6 +163,9 @@ static struct {
     u16 client_id;   // libretro client ID
     u16 devid;       // Host-assigned device ID
     u16 clttl;       // Client TTL (to check for disconnects)
+    u8 qmin;         // Shortest queue during the last reads...
+    u8 qreads;       // ...(how many)
+    u8 qowed;        // Empty packets that may still be skipped
     struct {
       u32 datalen;   // Byte count of data waiting to be polled.
       u8  data[16];  // Data received from client.
@@ -268,6 +288,38 @@ static u16 new_devid() {
     u16 n = rand_gen() ^ (u16)cpu_ticks;
     if (n)
       return n;
+  }
+}
+
+// Client slot `c` is about to be read: skips the stale empty packets at the
+// front of its queue (see RFU_PKT_STALE_READS).
+static void rfu_host_skip_stale(u32 c) {
+  u32 n = 0, j;
+  while (n < RFU_PKT_QUEUE_SIZE && rfu_host.clients[c].pkts[n].datalen)
+    n++;
+
+  if (!rfu_host.clients[c].qreads || n < rfu_host.clients[c].qmin)
+    rfu_host.clients[c].qmin = n;
+  if (++rfu_host.clients[c].qreads >= RFU_PKT_STALE_READS) {
+    rfu_host.clients[c].qreads = 0;
+    rfu_host.clients[c].qowed = 0;
+    if (rfu_host.clients[c].qmin >= RFU_PKT_STALE_MIN)
+      rfu_host.clients[c].qowed = rfu_host.clients[c].qmin - 1;
+  }
+
+  while (rfu_host.clients[c].qowed && n >= 2) {
+    const u32 len = MIN(16, rfu_host.clients[c].pkts[0].datalen);
+    if (len <= 2)
+      return;
+    for (j = 2; j < len; j++)
+      if (rfu_host.clients[c].pkts[0].data[j])
+        return;
+    RFU_DEBUG_LOG("Host skips a stale empty packet (client slot %d)\n", c);
+    memmove(&rfu_host.clients[c].pkts[0], &rfu_host.clients[c].pkts[1],
+            (RFU_PKT_QUEUE_SIZE - 1) * sizeof(rfu_host.clients[c].pkts[0]));
+    rfu_host.clients[c].pkts[RFU_PKT_QUEUE_SIZE - 1].datalen = 0;
+    rfu_host.clients[c].qowed--;
+    n--;
   }
 }
 
@@ -507,7 +559,10 @@ static s32 rfu_process_command() {
       u8 tmpbuf[16*4] = {0};
       rfu_buf[cnt++] = 0;   // Header contains byte counts as a bitfield.
       for (i = 0; i < 4; i++) {
-        u32 dlen = MIN(16, rfu_host.clients[i].pkts[0].datalen);
+        u32 dlen;
+        if (rfu_host.clients[i].devid)
+          rfu_host_skip_stale(i);
+        dlen = MIN(16, rfu_host.clients[i].pkts[0].datalen);
         if (rfu_host.clients[i].devid && dlen != 0) {
           RFU_DEBUG_LOG("Host reads data from client buffer (%d bytes)\n", dlen);
           // Accumulate into temp buffer
