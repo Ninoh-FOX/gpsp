@@ -21,8 +21,11 @@
 
 // Packets waiting to be read by the game, per peer. Over TCP the network
 // delivers them in bursts, faster than the game polls the adapter: with
-// only 4 slots the extra ones were dropped.
-#define RFU_PKT_QUEUE_SIZE 16
+// only 4 slots the extra ones were dropped. A full queue drops packets (link
+// error), and a WiFi that holds packets for a moment (Miyoo Mini <-> Android)
+// delivers them all at once: room for a few hundred ms of them. The latency
+// is kept down by the skipping below, not by the size.
+#define RFU_PKT_QUEUE_SIZE 32
 
 // The host's queues are for bursts, not a standing delay. The host's game
 // reads one packet per client each exchange, and a client answers each
@@ -36,9 +39,12 @@
 // zero after its 2 byte header (librfu UNI frame, which the game ignores). If
 // the queue of a client never went below RFU_PKT_STALE_MIN packets during
 // RFU_PKT_STALE_READS reads, that many packets minus one are owed, and are
-// taken from the empty ones as they come to the front (never the last one in
-// the queue: the host still gets an answer from that client).
-#define RFU_PKT_STALE_READS 60
+// taken from the empty ones anywhere in the queue (never the last one: the
+// host still gets an answer from that client; the packets with data keep
+// their order). Short windows: with a bursty network (Android frontends run
+// frames in bursts, WiFi spikes) the queue only stays up for a moment, and a
+// long window never saw it stay up, so nothing was skipped (~4 frames late).
+#define RFU_PKT_STALE_READS 15
 #define RFU_PKT_STALE_MIN    2
 
 // While the game waits for an event the network is read every this many
@@ -291,8 +297,8 @@ static u16 new_devid() {
   }
 }
 
-// Client slot `c` is about to be read: skips the stale empty packets at the
-// front of its queue (see RFU_PKT_STALE_READS).
+// Client slot `c` is about to be read: skips stale empty packets in its
+// queue (see RFU_PKT_STALE_READS).
 static void rfu_host_skip_stale(u32 c) {
   u32 n = 0, j;
   while (n < RFU_PKT_QUEUE_SIZE && rfu_host.clients[c].pkts[n].datalen)
@@ -307,16 +313,21 @@ static void rfu_host_skip_stale(u32 c) {
       rfu_host.clients[c].qowed = rfu_host.clients[c].qmin - 1;
   }
 
-  while (rfu_host.clients[c].qowed && n >= 2) {
-    const u32 len = MIN(16, rfu_host.clients[c].pkts[0].datalen);
-    if (len <= 2)
-      return;
-    for (j = 2; j < len; j++)
-      if (rfu_host.clients[c].pkts[0].data[j])
-        return;
+  j = 0;
+  while (rfu_host.clients[c].qowed && j + 1 < n) {
+    const u32 len = MIN(16, rfu_host.clients[c].pkts[j].datalen);
+    bool empty = len > 2;
+    u32 k;
+    for (k = 2; k < len && empty; k++)
+      if (rfu_host.clients[c].pkts[j].data[k])
+        empty = false;
+    if (!empty) {
+      j++;
+      continue;
+    }
     RFU_DEBUG_LOG("Host skips a stale empty packet (client slot %d)\n", c);
-    memmove(&rfu_host.clients[c].pkts[0], &rfu_host.clients[c].pkts[1],
-            (RFU_PKT_QUEUE_SIZE - 1) * sizeof(rfu_host.clients[c].pkts[0]));
+    memmove(&rfu_host.clients[c].pkts[j], &rfu_host.clients[c].pkts[j + 1],
+            (RFU_PKT_QUEUE_SIZE - 1 - j) * sizeof(rfu_host.clients[c].pkts[0]));
     rfu_host.clients[c].pkts[RFU_PKT_QUEUE_SIZE - 1].datalen = 0;
     rfu_host.clients[c].qowed--;
     n--;
