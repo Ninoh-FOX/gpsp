@@ -27,7 +27,13 @@
  * at the frames in SHOT_AT="f,f,..." or every SHOT_EVERY frames. SAVn=file
  * loads console n's save memory, SAVEOUT=dir writes them (dir/cN.sav) at
  * the end. BIOSDIR=dir: official BIOS (dir/gba_bios.bin) instead of the
- * built-in one. With PACE
+ * built-in one. FRAMELOG=dir writes dir/cN.log: per frame, the buttons and
+ * hashes of the screen, of its left strip and of its middle (to time when
+ * a button shows on screen); MEMLOG=off,off,... adds those EWRAM bytes to it
+ * ("iOFF": IWRAM, from a core built to give it as RETRO_MEMORY_VIDEO_RAM).
+ * RAMDUMP=dir saves the EWRAM (dir/cN_FRAME.ram, and .iwram the same way)
+ * at the SHOT_AT frames.
+ * With PACE
  * the harness prints how long the setup took and how many frames apart the
  * screens are.
  *
@@ -78,6 +84,7 @@ typedef struct {
   bool sound;             // Sound since the last frame
   uint32_t keys;
   bool bad;
+  FILE *framelog;         // FRAMELOG
 } console;
 
 static console con[MAXCON];
@@ -220,8 +227,19 @@ static const char *opt(int who, const char *key) {
   return NULL;
 }
 
+/* The core's log, with the console it comes from (corelog0..corelog3, below). */
+static void core_log(int who, enum retro_log_level level, const char *fmt, va_list ap) {
+  (void)level;
+  printf("[console %d] ", who);
+  vprintf(fmt, ap);
+}
+static const retro_log_printf_t core_logs[MAXCON];
+
 static bool env(int who, unsigned cmd, void *data) {
   switch (cmd) {
+  case RETRO_ENVIRONMENT_GET_LOG_INTERFACE:
+    ((struct retro_log_callback *)data)->log = core_logs[who];
+    return true;
   case RETRO_ENVIRONMENT_GET_VARIABLE: {
     struct retro_variable *v = data;
     v->value = opt(who, v->key);
@@ -292,6 +310,67 @@ static void video(int who, const void *data, unsigned w, unsigned h, size_t pitc
   /* A repeated frame with sound: held back by the time sync, not a wait. */
   if (!data && con[who].sound) con[who].frames_held++;
   con[who].sound = false;
+  /* FRAMELOG=dir: dir/cN.log, a line per frame: frame, buttons, a hash of
+   * the screen (0 if repeated) and the time in us. */
+  if (getenv("FRAMELOG")) {
+    if (!con[who].framelog) {
+      char path[512];
+      snprintf(path, sizeof(path), "%s/c%d.log", getenv("FRAMELOG"), who);
+      con[who].framelog = fopen(path, "w");
+    }
+    if (con[who].framelog) {
+      /* The whole screen, a strip on its left (the scenery: it only
+       * changes when the camera moves, that is when the player walks) and
+       * the middle (where the player is: it changes when they turn too). */
+      uint32_t hash = 0, strip = 0, middle = 0;
+      unsigned x, y;
+      if (data) {
+        hash = strip = middle = 2166136261u;
+        for (y = 0; y < h; y++)
+          for (x = 0; x < w; x++) {
+            const uint16_t p = ((const uint16_t *)((const uint8_t *)data + y * pitch))[x];
+            hash = (hash ^ p) * 16777619u;
+            if (x < 40)
+              strip = (strip ^ p) * 16777619u;
+            if (x >= w / 2 - 8 && x < w / 2 + 8 && y >= h / 2 - 16 && y < h / 2 + 16)
+              middle = (middle ^ p) * 16777619u;
+          }
+      }
+      fprintf(con[who].framelog, "%u %u %08x %08x %lld %08x", con[who].frames_shown + con[who].frames_dupe,
+              con[who].keys, hash, strip, (long long)now_us(), middle);
+      if (getenv("MEMLOG")) {
+        /* "iOFF": IWRAM, for a core that gives it as RETRO_MEMORY_VIDEO_RAM */
+        const uint8_t *ewram = con[who].get_memory_data(RETRO_MEMORY_SYSTEM_RAM);
+        const uint8_t *iwram = con[who].get_memory_data(RETRO_MEMORY_VIDEO_RAM);
+        const char *m = getenv("MEMLOG");
+        while (*m) {
+          char *e;
+          const bool iw = *m == 'i';
+          const unsigned long off = strtoul(m + iw, &e, 16);
+          const uint8_t *ram = iw ? iwram : ewram;
+          if (e == m + iw) break;
+          if (ram && off < (iw ? 32 : 256) * 1024u) fprintf(con[who].framelog, " %u", ram[off]);
+          m = *e ? e + 1 : e;
+        }
+      }
+      fputc('\n', con[who].framelog);
+    }
+  }
+  /* RAMDUMP=dir: the GBA's work RAM (EWRAM) at the SHOT_AT frames. */
+  if (data && getenv("RAMDUMP") && shot_wanted(con[who].frames_shown)) {
+    char path[512];
+    FILE *f;
+    snprintf(path, sizeof(path), "%s/c%d_%05u.ram", getenv("RAMDUMP"), who, con[who].frames_shown);
+    if ((f = fopen(path, "wb"))) {
+      fwrite(con[who].get_memory_data(RETRO_MEMORY_SYSTEM_RAM), 1, 256 * 1024, f);
+      fclose(f);
+    }
+    snprintf(path, sizeof(path), "%s/c%d_%05u.iwram", getenv("RAMDUMP"), who, con[who].frames_shown);
+    if (con[who].get_memory_data(RETRO_MEMORY_VIDEO_RAM) && (f = fopen(path, "wb"))) {
+      fwrite(con[who].get_memory_data(RETRO_MEMORY_VIDEO_RAM), 1, 32 * 1024, f);
+      fclose(f);
+    }
+  }
   if (data && getenv("SHOTS") && shot_wanted(con[who].frames_shown)) {
     char path[512];
     FILE *f;
@@ -322,11 +401,14 @@ static int16_t input_state(int who, unsigned port, unsigned dev, unsigned idx, u
   static int16_t input##n(unsigned p, unsigned d, unsigned i, unsigned id) { return input_state(n, p, d, i, id); } \
   static void np_send##n(int f, const void *b, size_t l, uint16_t c) { net_send(n, f, b, l, c); } \
   static void np_poll##n(void) { net_poll(n); } \
-  static size_t audio##n(const int16_t *d, size_t f) { con[n].sound = true; return f; }
+  static size_t audio##n(const int16_t *d, size_t f) { con[n].sound = true; return f; } \
+  static void corelog##n(enum retro_log_level l, const char *fmt, ...) \
+    { va_list ap; va_start(ap, fmt); core_log(n, l, fmt, ap); va_end(ap); }
 CBSET(0)
 CBSET(1)
 CBSET(2)
 CBSET(3)
+static const retro_log_printf_t core_logs[MAXCON] = { corelog0, corelog1, corelog2, corelog3 };
 
 static const retro_environment_t envs[MAXCON] = { env0, env1, env2, env3 };
 static const retro_video_refresh_t videos[MAXCON] = { video0, video1, video2, video3 };
@@ -758,6 +840,10 @@ int main(int argc, char **argv) {
   }
   }
   }
+
+  for (i = 0; i < ncon; i++)
+    if (con[i].framelog)
+      fclose(con[i].framelog);
 
   /* SAVEOUT=dir: each console's save memory, as dir/cN.sav. */
   if (getenv("SAVEOUT"))

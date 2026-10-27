@@ -391,7 +391,10 @@ u32 gbc_sound_master_volume;
    ((s32)(noise_table7[fp16_16_to_u32(sample_index) >> 5] <<                  \
    (fp16_16_to_u32(sample_index) & 0x1F)) >> 31) ^ 0x07                       \
 
+/* The index stays inside the table: it may come from the other (longer)
+ * noise mode, or step past more than a whole table at high frequencies. */
 #define gbc_sound_render_noise(type, noise_type, envelope_op, sweep_op)       \
+  sample_index %= u32_to_fp16_16(gbc_noise_wrap_##noise_type);                \
   for(i = 0; i < buffer_ticks; i++)                                           \
   {                                                                           \
     get_noise_sample_##noise_type();                                          \
@@ -399,7 +402,7 @@ u32 gbc_sound_master_volume;
                                                                               \
     sample_index += frequency_step;                                           \
                                                                               \
-    if(sample_index >= u32_to_fp16_16(gbc_noise_wrap_##noise_type))           \
+    while(sample_index >= u32_to_fp16_16(gbc_noise_wrap_##noise_type))        \
       sample_index -= u32_to_fp16_16(gbc_noise_wrap_##noise_type);            \
                                                                               \
     buffer_index = (buffer_index + 2) % BUFFER_SIZE;                          \
