@@ -441,6 +441,29 @@ void video_print_msg(uint16_t *dst, uint32_t h, uint32_t pitch, char *msg)
   basic_text_out16_nf(dst, pitch, 2, h - 10, msg);
 }
 
+/* Koriki: picture rectangle of the scaling on a screen w pixels wide (320 for
+   the scalers, 640 for the screen); 0 = the whole screen (4:3) */
+int koriki_picture_rect(int w, int *x, int *y, int *pw, int *ph)
+{
+  int k = w >= 640 ? 2 : 1;
+  switch (scaling_mode) {
+    case SCALING_NONE:
+      *x = 40 * k; *y = 40 * k; *pw = 240 * k; *ph = 160 * k;
+      return 1;
+    case SCALING_ASPECT_SHARP:
+    case SCALING_ASPECT_SMOOTH:
+    case SCALING_ASPECT_PIXEL:
+      /* the whole width, 3:2: 214 lines in the middle of 320x240 (where the
+         scalers draw); on the 640x480 screen 428 lines at the top, the name
+         of the console under them */
+      *x = 0; *y = k == 2 ? 0 : 13; *pw = 320 * k; *ph = 214 * k;
+      return 1;
+    default:
+      *x = 0; *y = 0; *pw = 320 * k; *ph = 240 * k;
+      return 0;
+  }
+}
+
 void video_scale(uint16_t *dst, uint32_t h, uint32_t pitch) {
   /* Koriki: the libretro core already applied colour correction and frame
      mixing (its own options); scale the frame it handed over */
@@ -449,15 +472,18 @@ void video_scale(uint16_t *dst, uint32_t h, uint32_t pitch) {
   if (!gba_screen_pixels_buf)
     return;
 
+
   switch (scaling_mode)
   {
     case SCALING_ASPECT_SHARP:
+    case SCALING_ASPECT_PIXEL:    /* on 320x240 (the menu background) */
       gba_smooth_subpx_upscale(dst, gba_screen_pixels_buf, 214);
       break;
     case SCALING_ASPECT_SMOOTH:
       gba_smooth_upscale(dst, gba_screen_pixels_buf, 214);
       break;
     case SCALING_FULL_SHARP:
+    case SCALING_FULL_PIXEL:
       gba_smooth_subpx_upscale(dst, gba_screen_pixels_buf, 240);
       break;
     case SCALING_FULL_SMOOTH:

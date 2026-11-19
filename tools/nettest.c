@@ -21,6 +21,11 @@
 #include <unistd.h>
 #include "libretro.h"
 #include "frontend/net.h"
+#ifdef MENU_TEST
+#include "frontend/menurun.h"
+void __wrap_plat_sleep_ms(int ms);
+void __real_plat_sleep_ms(int ms) { usleep(ms * 1000); }
+#endif
 
 /* More environment, for real games:
  *   KEYS="from-to:key+key;..."  buttons at those frames (counted from the
@@ -30,7 +35,10 @@
  *   BIOSDIR=dir  official BIOS (dir/gba_bios.bin); BOOT=bios|game
  *   SHOTS=dir  screens as dir/NNNNN.ppm every SHOT_EVERY frames (or at
  *        SHOT_AT="f,f,...")
- *   nettest solo ROM FRAMES OUT  runs without network */
+ *   nettest solo ROM FRAMES OUT  runs without network
+ *   MENU_AT=n MENU_MS=t  at session frame n the menu is open for t ms, as the
+ *        frontend does it (frontend/menurun.c: link it in, see below)
+ * With the menu test add frontend/menurun.c to the build. */
 
 static const char *role;
 static unsigned frame, sframe;   /* sframe: frames of the session (KEYS, SHOTS) */
@@ -156,6 +164,18 @@ int main(int argc, char **argv)
     up = solo ? 1 : !strcmp(role, "host") ? net_clients() > 0 : net_state() == NET_CONNECTED;
     if (up) { shot(); sframe++; }
     else if (sframe) { printf("[%s %u] link lost after %u frames\n", role, frame, sframe); break; }
+#ifdef MENU_TEST
+    if (up && getenv("MENU_AT") && sframe == (unsigned)atoi(getenv("MENU_AT"))) {
+      long t0 = ms(), len = getenv("MENU_MS") ? atoi(getenv("MENU_MS")) : 3000;
+      printf("[%s %u] menu open\n", role, sframe); fflush(stdout);
+      menu_run_begin();
+      while (ms() - t0 < len)
+        __wrap_plat_sleep_ms(10);       /* what libpicofe's menu does while it waits */
+      menu_run_end();
+      printf("[%s %u] menu closed after %ld ms\n", role, sframe, ms() - t0); fflush(stdout);
+      next = ms();
+    }
+#endif
     if (sframe >= frames) break;
     if (frame > 60 * 600) { printf("[%s] timeout, linked %u\n", role, sframe); break; }
     if (!getenv("NOPACE")) { next += 17; { long w = (long)(next - ms()); if (w > 0) usleep(w * 1000); else if (w < -500) next = ms(); } }

@@ -2,6 +2,7 @@
 #define __FRONTEND_SCALE_H__
 
 void video_post_process(void);
+int koriki_picture_rect(int w, int *x, int *y, int *pw, int *ph);
 void video_scale(uint16_t *dst, uint32_t dst_h, uint32_t dst_pitch);
 void video_clear_msg(uint16_t *dst, uint32_t dst_h, uint32_t dst_pitch);
 void video_print_msg(uint16_t *dst, uint32_t dst_h, uint32_t dst_pitch, char *msg);

@@ -21,11 +21,14 @@ CFLAGS    := -O2 $(ARCH) -fomit-frame-pointer -ffast-math -Wall -Wno-unused-func
              -I$(SYSROOT)/usr/include/SDL -D_GNU_SOURCE=1 -D_REENTRANT
 
 FE_OBJS   := frontend/main.o frontend/menu.o frontend/net.o frontend/config.o frontend/scale.o frontend/plat_trimui.o \
+             frontend/koriki_frame.o frontend/menurun.o \
              frontend/libpicofe/input.o frontend/libpicofe/in_sdl.o \
              frontend/libpicofe/linux/in_evdev.o frontend/libpicofe/linux/plat.o \
              frontend/libpicofe/fonts.o frontend/libpicofe/readpng.o frontend/libpicofe/config_file.o
 
-LIBS      := $(CORE_LIB) -lSDL -lpthread -lpng -lz -lm -Wl,--gc-sections -s
+# --wrap: the menu gives the core to the game behind it while libpicofe waits
+# for a key (frontend/menurun.c)
+LIBS      := $(CORE_LIB) -lSDL -lpthread -lpng -lz -lm -Wl,--gc-sections -Wl,--wrap=plat_sleep_ms -s
 
 all: $(BIN)
 

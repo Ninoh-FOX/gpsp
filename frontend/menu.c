@@ -130,7 +130,42 @@ static const char h_dynarec_enable[]  = "Improves performance, but may reduce ac
 
 static const char *men_frameskip[] = { "OFF", "Auto", "Manual", NULL };
 
-static const char *men_scaling[] = { "Native", "3:2 Sharp", "3:2 Smooth", "4:3 Sharp", "4:3 Smooth", NULL};
+/* Koriki: shown in groups (3:2, then 4:3); scaling_order gives the value of
+   each entry, the numbers saved in the config do not change */
+static const char *men_scaling[] = { "Native", "3:2 Pixel", "3:2 Sharp", "3:2 Smooth",
+  "4:3 Pixel", "4:3 Sharp", "4:3 Smooth", NULL};
+static const int scaling_order[] = { SCALING_NONE,
+  SCALING_ASPECT_PIXEL, SCALING_ASPECT_SHARP, SCALING_ASPECT_SMOOTH,
+  SCALING_FULL_PIXEL, SCALING_FULL_SHARP, SCALING_FULL_SMOOTH };
+static int scaling_entry;      /* the entry of men_scaling being edited */
+
+/* Koriki: borders drawn by code and a grid between the pixels (koriki_frame.c) */
+static const char *men_border[] = { "None", "GBA", "SP", NULL };
+static const char *men_grid[] = { "Off", "Soft", "Strong", NULL };
+static const char h_border[] = "Drawn around Native and 3:2";
+static const char h_grid[] = "Native: lines between the pixels.\n"
+          "Others: laid over the picture";
+
+static menu_entry e_menu_video[] =
+{
+  mee_enum         ("Scaling",                  0, scaling_entry, men_scaling),
+  mee_enum_h       ("Border",                   0, border_style, men_border, h_border),
+  mee_enum_h       ("Grid",                     0, grid_mode, men_grid, h_grid),
+  mee_end,
+};
+
+static int menu_loop_video(int id, int keys)
+{
+  static int sel = 0;
+  unsigned i;
+  scaling_entry = 0;
+  for (i = 0; i < sizeof(scaling_order) / sizeof(scaling_order[0]); i++)
+    if (scaling_order[i] == (int)scaling_mode)
+      scaling_entry = i;
+  me_loop(e_menu_video, &sel);
+  scaling_mode = scaling_order[scaling_entry];
+  return 0;
+}
 
 /* Koriki: libretro gpSP core option gpsp_sound_rate */
 static const char *men_sound_rate[] = { "32768 Hz", "65536 Hz", NULL };
@@ -144,7 +179,7 @@ static menu_entry e_menu_options[] =
 {
   mee_enum         ("Frameskip",                0, frameskip_style, men_frameskip),
   mee_range        ("Max Frameskip",            0, max_frameskip, 1, 5),
-  mee_enum         ("Scaling",                  0, scaling_mode, men_scaling),
+  mee_handler      ("Video",                    menu_loop_video),
   mee_onoff_h      ("Color Correction",         0, color_correct, 1, h_color_correct),
   mee_onoff_h      ("LCD Ghosting",             0, lcd_blend, 1, h_lcd_blend),
   mee_onoff_h      ("Dynamic Recompiler",       0, dynarec_enable, 1, h_dynarec_enable),
@@ -429,6 +464,8 @@ void menu_set_defaults(void)
   dynarec_enable = 1;
   frameskip_style = 1;
   scaling_mode = 0;
+  border_style = 1;
+  grid_mode = 0;
   max_frameskip = 3;
   color_correct = 0;
   lcd_blend = 0;

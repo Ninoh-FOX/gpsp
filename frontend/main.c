@@ -23,6 +23,7 @@
 #include "frontend/libpicofe/plat.h"
 #include "frontend/libpicofe/input.h"
 #include "frontend/net.h"
+#include "frontend/menurun.h"
 
 /* Same as picogpsp's HUD_LEN (plat.h may already define it) */
 #ifndef HUD_LEN
@@ -44,6 +45,8 @@ int sound_rate_high = 1;
 int turbo_frames = 4;  /* gpsp_turbo_period: frames of each turbo A/B cycle */
 int link_mode;         /* gpsp_serial, see link_mode_values */
 int link_players = 2;  /* gpsp_cable_players */
+int border_style = 1;  /* Koriki: GBA border */
+int grid_mode;         /* Koriki: grid off */
 
 /* kept for scale.c (its own post-processing is not used: the core does it) */
 uint16_t *gba_screen_pixels_prev = NULL;
@@ -237,6 +240,8 @@ static void toggle_fast_forward(int force_off)
   }
 }
 
+static int menu_requested;     /* MENU pressed: the menu opens after the frame */
+
 void handle_emu_action(emu_action action)
 {
   static frameskip_style_t prev_frameskip_style;
@@ -275,9 +280,9 @@ void handle_emu_action(emu_action action)
       toggle_fast_forward(0);
       break;
     case EACTION_MENU:
-      toggle_fast_forward(1);
-      update_backup();
-      menu_loop();
+      /* Koriki: opened by the main loop once the frame is over (this runs
+         inside retro_run(), and the game behind the menu needs the core) */
+      menu_requested = 1;
       break;
     default:
       break;
@@ -424,11 +429,15 @@ static void video_refresh(const void *data, unsigned width, unsigned height, siz
 static void audio_sample(int16_t left, int16_t right)
 {
   int16_t s[2] = { left, right };
+  if (menu_run_active)
+    return;                         /* the game behind the menu: no sound */
   plat_sound_write(s, sizeof(s));
 }
 
 static size_t audio_sample_batch(const int16_t *data, size_t frames)
 {
+  if (menu_run_active)
+    return frames;
   plat_sound_write((void *)data, frames * 2 * sizeof(int16_t));
   return frames;
 }
@@ -455,6 +464,10 @@ static void input_poll(void)
   unsigned int emu_act;
   int which = EACTION_NONE;
 
+  if (menu_run_active) {            /* the game behind the menu: no buttons */
+    player_keys = 0;
+    return;
+  }
   in_update(actions);
   emu_act = actions[IN_BINDTYPE_EMU];
   if (emu_act) {
@@ -599,6 +612,14 @@ int main(int argc, char *argv[])
     count_fps();
     if (frame_rendered)
       plat_video_flip();
+    if (menu_requested) {
+      menu_requested = 0;
+      toggle_fast_forward(1);
+      update_backup();
+      menu_run_begin();             /* Koriki: in a link session the game goes on */
+      menu_loop();
+      menu_run_end();
+    }
     /* the core may change its rate when gpsp_sound_rate changes */
     if (options_changed == 0 && (++frames % 600) == 0)
       update_backup();    /* every ~10 s, only when the game wrote its save */

@@ -4,6 +4,7 @@
 #include "frontend/main.h"
 #include "frontend/plat.h"
 #include "frontend/scale.h"
+#include "frontend/koriki_frame.h"
 #include "frontend/libpicofe/menu.h"
 #include "frontend/libpicofe/plat.h"
 #include "frontend/libpicofe/input.h"
@@ -105,29 +106,71 @@ static void *fb_flip(void)
   return screen->pixels;
 }
 
+/* Koriki: the screen is always 640x480 (the panel's mode on the V1-V3 and
+   Plus, stretched by the panel on the V4). The game is drawn there:
+   - grid on: every scaling, nearest pixel, with the grid between the GBA
+     pixels (kf_scale_grid);
+   - grid off: the scalers of picogpsp on a 320x240 picture, doubled.
+   The menu of libpicofe is drawn on a 320x240 buffer, doubled too. The border
+   is painted once, when the options change or after the menu or a message
+   (border_dirty). */
+static uint16_t menubuf[320 * 240];      /* the menu (g_menuscreen_ptr) */
+static uint16_t pic320[320 * 240];       /* the picture without the grid */
+static int border_dirty = 1, msg_shown;
+static int last_scaling = -1, last_border = -1, last_grid = -1;
+
+/* copies the w x h block at (sx, sy) of a 320 wide picture doubled to the
+   screen at (dx, dy) */
+static void double_rect(const uint16_t *src, int sx, int sy, int dx, int dy, int w, int h)
+{
+  int pitch = screen->pitch / 2, i, j;
+  for (j = 0; j < h; j++) {
+    const uint16_t *s = src + (sy + j) * 320 + sx;
+    uint32_t *d0 = (uint32_t *)((uint16_t *)screen->pixels + (dy + 2 * j) * pitch + dx);
+    for (i = 0; i < w; i++)
+      d0[i] = s[i] | ((uint32_t)s[i] << 16);
+    memcpy((uint16_t *)d0 + pitch, d0, 2 * w * sizeof(uint16_t));
+  }
+}
+
+static void paint_border(void)
+{
+  static const int style[3] = { KF_BORDER_NONE, KF_BORDER_GBA, KF_BORDER_SP };
+  int x, y, w, h;
+  if (koriki_picture_rect(640, &x, &y, &w, &h))
+    kf_draw_border(screen->pixels, screen->pitch / 2, 640, 480, x, y, w, h,
+                   style[border_style >= 0 && border_style <= 2 ? border_style : 0]);
+  else
+    memset(screen->pixels, 0, screen->pitch * 480);
+}
+
 void plat_video_menu_enter(int is_rom_loaded)
 {
+  border_dirty = 1;
 }
 
 void plat_video_menu_begin(void)
 {
-  g_menuscreen_ptr = fb_flip();
+  g_menuscreen_ptr = menubuf;
 }
 
 void plat_video_menu_end(void)
 {
-  g_menuscreen_ptr = fb_flip();
+  SDL_LockSurface(screen);
+  double_rect(menubuf, 0, 0, 0, 0, 320, 240);
+  SDL_UnlockSurface(screen);
+  SDL_Flip(screen);
+  g_menuscreen_ptr = menubuf;
 }
 
 void plat_video_menu_leave(void)
 {
+  memset(menubuf, 0, sizeof(menubuf));
   SDL_LockSurface(screen);
-  memset(g_menuscreen_ptr, 0, 320 * 240 * sizeof(uint16_t));
+  memset(screen->pixels, 0, screen->pitch * 480);
   SDL_UnlockSurface(screen);
-  g_menuscreen_ptr = fb_flip();
-  SDL_LockSurface(screen);
-  memset(g_menuscreen_ptr, 0, 320 * 240 * sizeof(uint16_t));
-  SDL_UnlockSurface(screen);
+  SDL_Flip(screen);
+  border_dirty = 1;
 }
 
 void plat_video_open(void)
@@ -141,18 +184,65 @@ void plat_video_set_msg(char *new_msg)
 
 void plat_video_flip(void)
 {
+  int x, y, w, h;
+
   video_post_process();
+  if (last_scaling != (int)scaling_mode || last_border != border_style || last_grid != grid_mode) {
+    last_scaling = scaling_mode;
+    last_border = border_style;
+    last_grid = grid_mode;
+    border_dirty = 1;
+  }
+  /* a message covers the bottom lines: the border is painted again after it */
+  if (msg[0])
+    msg_shown = 1;
+  else if (msg_shown) {
+    msg_shown = 0;
+    border_dirty = 1;
+  }
+
   SDL_LockSurface(screen);
-  if (msg[0])
-    video_clear_msg(screen->pixels, screen->h, screen->pitch / sizeof(uint16_t));
-
-  video_scale(screen->pixels, screen->h, screen->pitch / sizeof(uint16_t));
-
-  if (msg[0])
-    video_print_msg(screen->pixels, screen->h, screen->pitch / sizeof(uint16_t), msg);
+  if (border_dirty) {
+    paint_border();
+    border_dirty = 0;
+  }
+  if (!koriki_picture_rect(640, &x, &y, &w, &h)) {
+    x = y = 0; w = 640; h = 480;
+  }
+  {
+    uint16_t *dst = (uint16_t *)screen->pixels + y * (screen->pitch / 2) + x;
+    int pitch = screen->pitch / 2;
+    if (scaling_mode == SCALING_NONE && grid_mode && koriki_frame)
+      /* Native: 2x, every pixel the same size, the grid exactly between them */
+      kf_scale_grid(dst, pitch, koriki_frame, koriki_frame_pitch, 240, 160, w, h, 0x0000, grid_mode);
+    else {
+      if ((scaling_mode == SCALING_ASPECT_PIXEL || scaling_mode == SCALING_FULL_PIXEL) && koriki_frame)
+        /* Pixel: nearest pixel straight on the 640x480 screen */
+        kf_scale_grid(dst, pitch, koriki_frame, koriki_frame_pitch, 240, 160, w, h, 0x0000, 0);
+      else {
+        int sx, sy, sw, sh;
+        if (!koriki_picture_rect(320, &sx, &sy, &sw, &sh)) {
+          sx = sy = 0; sw = 320; sh = 240;
+        }
+        video_scale(pic320, 240, 320);
+        double_rect(pic320, sx, sy, x, y, sw, sh);
+      }
+      /* stretched: the pixels are not all the same size, so the grid is laid
+         over the picture, the same everywhere (as Koriki's ATC-GRID overlay) */
+      if (grid_mode && scaling_mode != SCALING_NONE)
+        kf_overlay_grid(dst, pitch, w, h, grid_mode);
+    }
+  }
+  if (msg[0]) {
+    /* the message on a 320 wide strip, doubled at the bottom of the screen */
+    static uint16_t strip[320 * 240];
+    memset(strip + 230 * 320, 0, 10 * 320 * sizeof(uint16_t));
+    video_print_msg(strip, 240, 320, msg);
+    double_rect(strip, 0, 230, 0, 460, 320, 10);
+  }
   SDL_UnlockSurface(screen);
 
-  g_menuscreen_ptr = fb_flip();
+  fb_flip();
   msg[0] = 0;
 }
 
@@ -299,7 +389,7 @@ void plat_sdl_event_handler(void *event_)
 int plat_init(void)
 {
   SDL_Init(SDL_INIT_VIDEO);
-  screen = SDL_SetVideoMode(320, 240, 16, SDL_SWSURFACE);
+  screen = SDL_SetVideoMode(640, 480, 16, SDL_SWSURFACE);   /* Koriki: see plat_video_flip */
 
   if (screen == NULL) {
     printf("%s, failed to set video mode\n", __func__);
@@ -311,7 +401,7 @@ int plat_init(void)
   g_menuscreen_w = 320;
   g_menuscreen_h = 240;
   g_menuscreen_pp = 320;
-  g_menuscreen_ptr = fb_flip();
+  g_menuscreen_ptr = menubuf;
 
   if (in_sdl_init(&in_sdl_platform_data, plat_sdl_event_handler)) {
     fprintf(stderr, "SDL input failed to init: %s\n", SDL_GetError());

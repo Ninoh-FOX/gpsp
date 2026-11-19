@@ -29,6 +29,8 @@ static const struct {
   CE_NUM(turbo_frames),
   CE_NUM(link_mode),
   CE_NUM(link_players),
+  CE_NUM(border_style),
+  CE_NUM(grid_mode),
 };
 
 void config_write(FILE *f)

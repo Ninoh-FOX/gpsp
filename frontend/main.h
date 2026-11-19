@@ -44,6 +44,8 @@ typedef enum {
   SCALING_ASPECT_SMOOTH,
   SCALING_FULL_SHARP,
   SCALING_FULL_SMOOTH,
+  SCALING_ASPECT_PIXEL,   /* Koriki: nearest pixel on the 640x480 screen */
+  SCALING_FULL_PIXEL,
 } scaling_mode_t;
 
 
@@ -57,6 +59,8 @@ extern int max_frameskip;
 extern int color_correct;
 extern int lcd_blend;
 extern int show_fps;
+extern int border_style;   /* Koriki: 0 none, 1 GBA, 2 SP (koriki_frame.c) */
+extern int grid_mode;      /* Koriki: 0 off, 1 soft, 2 strong */
 extern int limit_frames;
 extern int turbo_frames;        /* gpsp_turbo_period */
 extern int link_mode;           /* gpsp_serial: index in link_mode_values */
