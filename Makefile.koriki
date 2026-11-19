@@ -1,0 +1,47 @@
+# gpSP standalone for Koriki (Miyoo Mini):
+#   this gpSP core (Cable Link / RFU netpacket fork, built as is, platform rpi2 = Cortex-A7 NEON hard-float,
+#   ARM dynarec) statically linked with the picogpsp frontend (frontend/), which drives it
+#   through the libretro API (frontend/main.c).
+#   make -f Makefile.koriki            -> picogpsp
+TC        ?= /opt/miyoomini-toolchain
+CROSS     ?= $(TC)/bin/arm-linux-gnueabihf-
+SYSROOT   := $(TC)/arm-miyoomini-linux-gnueabihf/sysroot
+CC        := $(CROSS)gcc
+CXX       := $(CROSS)g++
+AR        := $(CROSS)ar
+BIN       := picogpsp
+CORE_LIB  := libgpsp_core.a
+
+ARCH      := -marm -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard
+# same defines as the core build, so the core headers the frontend includes match
+CORE_DEFS := -DHAVE_STRINGS_H -DHAVE_STDINT_H -DHAVE_INTTYPES_H -D__LIBRETRO__ -DINLINE=inline -DHAVE_DYNAREC -DMMAP_JIT_CACHE -DARM_ARCH
+CFLAGS    := -O2 $(ARCH) -fomit-frame-pointer -ffast-math -Wall -Wno-unused-function \
+             $(CORE_DEFS) -DKORIKI -DPICO_HOME_DIR='"/.picogpsp/"' \
+             -I. -Ilibretro -Ilibretro/libretro-common/include -Ifrontend \
+             -I$(SYSROOT)/usr/include/SDL -D_GNU_SOURCE=1 -D_REENTRANT
+
+FE_OBJS   := frontend/main.o frontend/menu.o frontend/net.o frontend/config.o frontend/scale.o frontend/plat_trimui.o \
+             frontend/libpicofe/input.o frontend/libpicofe/in_sdl.o \
+             frontend/libpicofe/linux/in_evdev.o frontend/libpicofe/linux/plat.o \
+             frontend/libpicofe/fonts.o frontend/libpicofe/readpng.o frontend/libpicofe/config_file.o
+
+LIBS      := $(CORE_LIB) -lSDL -lpthread -lpng -lz -lm -Wl,--gc-sections -s
+
+all: $(BIN)
+
+# the core, untouched, through its own Makefile
+$(CORE_LIB): FORCE
+	$(MAKE) -f Makefile platform=rpi2 STATIC_LINKING=1 TARGET=$(CORE_LIB) CC=$(CC) CXX=$(CXX) AR=$(AR)
+
+frontend/%.o: frontend/%.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(BIN): $(CORE_LIB) $(FE_OBJS)
+	$(CXX) $(ARCH) -o $@ $(FE_OBJS) $(LIBS)
+
+clean:
+	$(MAKE) -f Makefile platform=rpi2 STATIC_LINKING=1 TARGET=$(CORE_LIB) clean
+	rm -f $(FE_OBJS) $(BIN) $(CORE_LIB)
+
+FORCE:
+.PHONY: all clean FORCE
