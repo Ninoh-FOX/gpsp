@@ -6,7 +6,9 @@
  * the core is libretro/gpsp as is, so it can be updated without touching this.
  *
  * Same file names and behaviour as picogpsp: <rom>.sav, <rom>.st0..9 and
- * <rom>.cfg in $HOME/.picogpsp/, picogpsp.cfg for the global options. The
+ * <rom>.cfg in $HOME/.picogpsp/, picogpsp.cfg for the global options. With
+ * KORIKI_SAVE_BASE set (the launcher does it) the save is that path + .srm,
+ * the file of RetroArch's gpSP. The
  * options of the frontend menu are handed to the core as libretro options.
  */
 #include <stdio.h>
@@ -122,6 +124,17 @@ void config_file_name(char *buf, size_t len, int is_game)
 
 static uint8_t *saved_copy;   /* last contents written to <rom>.sav */
 
+/* $KORIKI_SAVE_BASE.srm (RetroArch's), or <rom>.sav in $HOME/.picogpsp/ */
+static void backup_name(char *buf, size_t len)
+{
+  const char *base = getenv("KORIKI_SAVE_BASE");
+
+  if (base && *base)
+    snprintf(buf, len, "%s.srm", base);
+  else
+    gamepak_related_name(buf, len, ".sav");
+}
+
 static void backup_load(void)
 {
   char name[MAXPATHLEN];
@@ -131,7 +144,7 @@ static void backup_load(void)
 
   if (!mem || !size)
     return;
-  gamepak_related_name(name, sizeof(name), ".sav");
+  backup_name(name, sizeof(name));
   f = fopen(name, "rb");
   if (f) {
     if (fread(mem, 1, size, f) == 0)
@@ -153,7 +166,7 @@ static void update_backup(void)
 
   if (!mem || !size || (saved_copy && !memcmp(saved_copy, mem, size)))
     return;
-  gamepak_related_name(name, sizeof(name), ".sav");
+  backup_name(name, sizeof(name));
   f = fopen(name, "wb");
   if (!f)
     return;

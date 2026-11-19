@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include "libretro.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Netplay for the core's netpacket interface (Cable Link, Wireless Adapter,
  * Pokemon / Advance Wars modes) between standalone consoles on a local
  * network. It does what RetroArch's netplay does for a netpacket core: it
@@ -51,5 +55,9 @@ int net_discover(net_found_t *found, int max, unsigned timeout_ms);
 
 /* the frontend shows these on screen */
 void net_message(const char *text, unsigned ms);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
