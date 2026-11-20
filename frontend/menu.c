@@ -172,6 +172,11 @@ static const char *men_sound_rate[] = { "32768 Hz", "65536 Hz", NULL };
 static const char h_sound_rate[]      = "65536 renders the full mixer bandwidth\n"
           "(needed by some games, e.g. Golden Sun)";
 
+/* Koriki: libretro gpSP core option gpsp_boot_mode */
+static const char *men_boot[] = { "Game", "BIOS", NULL };
+static const char h_boot[]            = "BIOS: the GBA intro before the game.\n"
+          "Applied on the next start or reset";
+
 static const char h_turbo[]           = "X = turbo A, Y = turbo B:\n"
           "frames of each press-release cycle";
 
@@ -184,6 +189,7 @@ static menu_entry e_menu_options[] =
   mee_onoff_h      ("LCD Ghosting",             0, lcd_blend, 1, h_lcd_blend),
   mee_onoff_h      ("Dynamic Recompiler",       0, dynarec_enable, 1, h_dynarec_enable),
   mee_enum_h       ("Sound Rate",               0, sound_rate_high, men_sound_rate, h_sound_rate),
+  mee_enum_h       ("Boot",                     0, boot_mode_bios, men_boot, h_boot),
   mee_range_h      ("Turbo period (frames)",    0, turbo_frames, 4, 60, h_turbo),
   mee_onoff_h      ("Show FPS",                 0, show_fps, 1, h_show_fps),
   mee_cust_nosave  ("Save global config",       MA_OPT_SAVECFG,      mh_savecfg, mgn_saveloadcfg),
@@ -472,6 +478,7 @@ void menu_set_defaults(void)
   show_fps = 0;
   limit_frames = 1;
   sound_rate_high = 1;
+  boot_mode_bios = 0;
   turbo_frames = 4;
   link_mode = 0;
   link_players = 2;

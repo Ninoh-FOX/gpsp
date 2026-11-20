@@ -42,6 +42,7 @@ int lcd_blend;
 int show_fps;
 int limit_frames;
 int sound_rate_high = 1;
+int boot_mode_bios;           /* Koriki: gpsp_boot_mode, 1 = through the BIOS intro */
 int turbo_frames = 4;  /* gpsp_turbo_period: frames of each turbo A/B cycle */
 int link_mode;         /* gpsp_serial, see link_mode_values */
 int link_players = 2;  /* gpsp_cable_players */
@@ -311,7 +312,7 @@ static const char *option_value(const char *key)
     return num;
   }
   if (!strcmp(key, "gpsp_bios"))             return "auto";   /* gba_bios.bin in the app folder, else built-in */
-  if (!strcmp(key, "gpsp_boot_mode"))        return "game";
+  if (!strcmp(key, "gpsp_boot_mode"))        return boot_mode_bios ? "bios" : "game";
   if (!strcmp(key, "gpsp_rumble"))           return "auto";
   if (!strcmp(key, "gpsp_turbo_period")) {
     if (turbo_frames < 4 || turbo_frames > 120)

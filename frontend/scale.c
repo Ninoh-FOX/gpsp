@@ -454,9 +454,11 @@ int koriki_picture_rect(int w, int *x, int *y, int *pw, int *ph)
     case SCALING_ASPECT_SMOOTH:
     case SCALING_ASPECT_PIXEL:
       /* the whole width, 3:2: 214 lines in the middle of 320x240 (where the
-         scalers draw); on the 640x480 screen 428 lines at the top, the name
-         of the console under them */
-      *x = 0; *y = k == 2 ? 0 : 13; *pw = 320 * k; *ph = 214 * k;
+         scalers draw); on the 640x480 screen 428 lines, at the top with the
+         SP border (the name of the console under them, as Koriki's overlay),
+         in the middle with the GBA border or none */
+      *x = 0; *y = k == 2 ? (border_style == 2 ? 0 : 26) : 13;
+      *pw = 320 * k; *ph = 214 * k;
       return 1;
     default:
       *x = 0; *y = 0; *pw = 320 * k; *ph = 240 * k;

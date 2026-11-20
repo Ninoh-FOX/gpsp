@@ -26,6 +26,7 @@ static const struct {
   CE_NUM(lcd_blend),
   CE_NUM(show_fps),
   CE_NUM(sound_rate_high),
+  CE_NUM(boot_mode_bios),
   CE_NUM(turbo_frames),
   CE_NUM(link_mode),
   CE_NUM(link_players),

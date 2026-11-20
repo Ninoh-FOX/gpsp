@@ -66,6 +66,7 @@ extern int turbo_frames;        /* gpsp_turbo_period */
 extern int link_mode;           /* gpsp_serial: index in link_mode_values */
 extern int link_players;        /* gpsp_cable_players (2-4) */
 extern const char *const link_mode_values[];
+extern int boot_mode_bios;          /* gpsp_boot_mode: 1 = boot through the BIOS */
 extern int sound_rate_high;     /* gpsp_sound_rate: 1 = 65536 Hz (full mixer), 0 = 32768 */
 
 extern uint16_t *gba_screen_pixels_prev;

@@ -235,8 +235,13 @@ void kf_draw_border(uint16_t *px, int pitch, int w, int h,
 		/* the name as it is in Koriki's GBA / GBA SP overlays */
 		const kf_logo *l = style == KF_BORDER_SP ? &kf_logo_sp : &kf_logo_gba;
 		fill(&s, 0, 0, w, h, 0, 0, 0);
-		if (style == KF_BORDER_GBA)
+		if (style == KF_BORDER_GBA) {
 			side_lamp(&s, lab, wx, wy, wh, 0.33, u, "POWER", 0, 148, 149, 153);
+			/* GBA: the SP name without "SP"; reduced when it would touch
+			 * the shadow (3:2 centred: 26 lines under the picture) */
+			if (bottom < l->h + 2 * shadow)
+				l = &kf_logo_gba_small;
+		}
 		if (bottom >= l->h + 2)
 			logo(&s, l, w / 2, wy + wh + (bottom - l->h) / 2);
 		break;
