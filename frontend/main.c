@@ -343,11 +343,35 @@ static void log_printf(enum retro_log_level level, const char *fmt, ...)
   va_end(ap);
 }
 
+/* Koriki: the Miyoo Mini motor is on or off (GPIO 48), as in Koriki's
+   RetroArch (sdl_miyoomini_joypad.c): any strength turns it on and it stops
+   RUMBLE_MS after the last one (200 ms x input_rumble_gain 50 %), so a pulse
+   shorter than a frame is still felt. The core calls this every frame, weak
+   and strong (strong at half strength): a zero never stops it at once. */
+#define RUMBLE_MS 100
+static unsigned rumble_until;
+static int rumble_on;
+
 static bool set_rumble(unsigned port, enum retro_rumble_effect effect, uint16_t strength)
 {
-  (void)port; (void)effect;
-  plat_trigger_vibrate(0, strength, strength);
+  unsigned now = plat_get_ticks_ms();
+  (void)effect;
+  if (port)
+    return false;
+  if (strength) {
+    rumble_until = now + RUMBLE_MS;
+    if (!rumble_on)
+      plat_trigger_vibrate(0, 1, 1);
+    rumble_on = 1;
+  } else if (rumble_on && (int)(now - rumble_until) >= 0)
+    rumble_stop();
   return true;
+}
+
+void rumble_stop(void)
+{
+  plat_trigger_vibrate(0, 0, 0);
+  rumble_on = 0;
 }
 
 static bool environment(unsigned cmd, void *data)
@@ -540,6 +564,7 @@ static void report_audio_buffer(void)
 
 static void quit(void)
 {
+  rumble_stop();
   net_stop();
   update_backup();
   retro_unload_game();
@@ -615,6 +640,7 @@ int main(int argc, char *argv[])
       plat_video_flip();
     if (menu_requested) {
       menu_requested = 0;
+      rumble_stop();                /* off in the menu (in a link session the game behind it may turn it on again) */
       toggle_fast_forward(1);
       update_backup();
       menu_run_begin();             /* Koriki: in a link session the game goes on */
