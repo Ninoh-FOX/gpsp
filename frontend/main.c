@@ -45,6 +45,7 @@ int sound_rate_high = 1;
 int boot_mode_bios;           /* Koriki: gpsp_boot_mode, 1 = through the BIOS intro */
 int turbo_frames = 4;  /* gpsp_turbo_period: frames of each turbo A/B cycle */
 int link_mode;         /* gpsp_serial, see link_mode_values */
+static int loaded_link_mode;
 int link_players = 2;  /* gpsp_cable_players */
 int border_style = 1;  /* Koriki: GBA border */
 int grid_mode;         /* Koriki: grid off */
@@ -294,6 +295,11 @@ void handle_emu_action(emu_action action)
 
 /* ---------------------------------------------------------------- libretro */
 
+bool link_mode_pending(void)
+{
+  return link_mode != loaded_link_mode;
+}
+
 static const char *option_value(const char *key)
 {
   static char num[8];
@@ -354,10 +360,16 @@ static int rumble_on;
 
 static bool set_rumble(unsigned port, enum retro_rumble_effect effect, uint16_t strength)
 {
-  unsigned now = plat_get_ticks_ms();
+  unsigned now;
   (void)effect;
   if (port)
     return false;
+  if (menu_run_active) {
+    if (rumble_on)
+      rumble_stop();
+    return true;
+  }
+  now = plat_get_ticks_ms();
   if (strength) {
     rumble_until = now + RUMBLE_MS;
     if (!rumble_on)
@@ -617,6 +629,7 @@ int main(int argc, char *argv[])
     plat_finish();
     return -1;
   }
+  loaded_link_mode = link_mode;
   retro_get_system_av_info(&av);
   if (av.timing.sample_rate > 0)
     koriki_audio_in_rate = (unsigned)av.timing.sample_rate;

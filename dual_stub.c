@@ -77,7 +77,7 @@ void dual_session_start(unsigned client_id) {
 }
 
 bool dual_peer_connected(unsigned client_id) { return true; }
-void dual_peer_disconnected(unsigned client_id) {}
+void dual_peer_disconnected(unsigned client_id, unsigned clients_left) {}
 
 void dual_session_stop(void) {
   in_session = false;

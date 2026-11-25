@@ -875,7 +875,7 @@ static void netpacket_disconnected(uint16_t client_id) {
 #ifndef GPSP_INSTANCE_B
   if (serial_mode == SERIAL_MODE_SERIAL_CABLE ||
       serial_mode == SERIAL_MODE_DUAL_CABLE)
-    dual_peer_disconnected(client_id);
+    dual_peer_disconnected(client_id, netplay_num_clients);
 #endif
   if (serial_mode == SERIAL_MODE_SERIAL_CABLE)
     serialcable_peer_disconnected(client_id);
@@ -1187,6 +1187,21 @@ void retro_set_input_poll(retro_input_poll_t cb)
 
 void retro_set_controller_port_device(unsigned port, unsigned device) {}
 
+static void read_boot_mode(void)
+{
+   struct retro_variable var = { "gpsp_boot_mode", NULL };
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "game"))
+         selected_boot_mode = boot_game;
+      else if (!strcmp(var.value, "bios"))
+         selected_boot_mode = boot_bios;
+   }
+   if (cable_bios_boot)
+      selected_boot_mode = boot_bios;
+}
+
 void retro_reset(void)
 {
 #ifndef GPSP_INSTANCE_B
@@ -1197,6 +1212,7 @@ void retro_reset(void)
       return;
    }
 #endif
+   read_boot_mode();
    reset_gba();
 }
 
@@ -1378,17 +1394,7 @@ static void check_variables(bool started_from_load)
            selected_bios = official_bios;
      }
 
-     var.key                = "gpsp_boot_mode";
-     var.value              = 0;
-     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
-     {
-        if (!strcmp(var.value, "game"))
-           selected_boot_mode = boot_game;
-        else if (!strcmp(var.value, "bios"))
-           selected_boot_mode = boot_bios;
-     }
-     if (cable_bios_boot)
-        selected_boot_mode = boot_bios;
+     read_boot_mode();
 
      var.key                = "gpsp_rtc";
      var.value              = 0;

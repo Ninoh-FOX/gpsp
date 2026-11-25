@@ -36,10 +36,12 @@ static void *run_thread(void *arg)
   clock_gettime(CLOCK_MONOTONIC, &next);
   while (thread_on) {
     pthread_mutex_lock(&core_mx);
-    if (thread_on && link_peer()) {
+    if (thread_on) {
       net_poll();
-      retro_run();
-      frames++;
+      if (link_peer()) {
+        retro_run();
+        frames++;
+      }
     }
     pthread_mutex_unlock(&core_mx);
     /* one GBA frame: 280896 cycles at 16777216 Hz = 16742.7 us */
@@ -96,6 +98,8 @@ void menu_run_end(void)
 void __wrap_plat_sleep_ms(int ms)
 {
   if (locked) {
+    if (!thread_on && (net_state() == NET_HOSTING || net_state() == NET_CONNECTING))
+      net_poll();
     thread_start();                     /* someone may have joined from the Link menu */
     if (thread_on) {
       pthread_mutex_unlock(&core_mx);

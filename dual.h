@@ -91,7 +91,7 @@ void dual_set_other_games(bool on);
 void dual_set_cfg(uint32_t cfg);
 void dual_session_start(unsigned client_id);
 bool dual_peer_connected(unsigned client_id);
-void dual_peer_disconnected(unsigned client_id);
+void dual_peer_disconnected(unsigned client_id, unsigned clients_left);
 void dual_session_stop(void);
 bool dual_net_receive(const void *buf, size_t len, uint16_t client_id);
 bool dual_setting_up(void);

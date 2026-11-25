@@ -323,6 +323,12 @@ static int mh_link(int id, int keys)
 {
   int n;
 
+  if ((id == MA_LINK_HOST || id == MA_LINK_JOIN || id == MA_LINK_LAST) &&
+      link_mode_pending()) {
+    menu_update_msg("Link mode changes on the next game load");
+    return 0;
+  }
+
   switch (id) {
   case MA_LINK_HOST:
     if (net_host()) {

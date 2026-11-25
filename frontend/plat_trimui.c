@@ -316,18 +316,21 @@ float plat_sound_capacity(void)
    the Trimui build forced 48000 Hz into the core, which breaks the sound of
    games such as Golden Sun); here it is converted to the 48 kHz output with
    linear interpolation, keeping the position between calls. */
-static int koriki_push(short v)
+static int koriki_push_stereo(short left, short right)
 {
-  while (((buf_w + 1) % BUF_LEN) == buf_r) {
+  const int next = (buf_w + 1) % BUF_LEN;
+  const int after_pair = (buf_w + 2) % BUF_LEN;
+
+  while (next == buf_r || after_pair == buf_r) {
     SDL_UnlockAudio();
     if (!limit_frames)
       return 0;
     plat_sleep_ms(1);
     SDL_LockAudio();
   }
-  buf[buf_w] = v;
-  ++buf_w;
-  buf_w %= BUF_LEN;
+  buf[buf_w] = left;
+  buf[next] = right;
+  buf_w = after_pair;
   return 1;
 }
 
@@ -345,8 +348,8 @@ void plat_sound_write(void *data, int bytes)
     in += 2;
     while (pos < 0x10000) {
       int f = pos;
-      if (!koriki_push((short)(prev_l + (((l - prev_l) * f) >> 16))) ||
-          !koriki_push((short)(prev_r + (((r - prev_r) * f) >> 16))))
+      if (!koriki_push_stereo((short)(prev_l + (((int64_t)(l - prev_l) * f) >> 16)),
+                              (short)(prev_r + (((int64_t)(r - prev_r) * f) >> 16))))
         return;               /* not limiting frames: drop, as the original does */
       pos += step;
     }

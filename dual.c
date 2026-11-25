@@ -1952,10 +1952,19 @@ bool dual_peer_connected(unsigned client_id) {
   return true;
 }
 
-void dual_peer_disconnected(unsigned client_id) {
+void dual_peer_disconnected(unsigned client_id, unsigned clients_left) {
   unsigned s;
-  if (!ds.is_host || ds.state == DS_OFF)
+  if (!ds.is_host)
     return;
+  if (ds.state == DS_OFF) {
+    // Two players, nobody left: the other console had another game (or
+    // settings), or the cable already stopped (it stopped answering, its
+    // BYE, out of sync) before the frontend told us it left: the cable
+    // waits for the next one.
+    if (((ds.gave_up && ds.players == 2) || ds.n == 2) && !clients_left)
+      dual_session_start(0);
+    return;
+  }
   if (ds.state == DS_WAIT) {
     // Not playing yet: it just is not there any more. (A HELLO it sent
     // before the frontend told us about it is forgotten too: the next
@@ -1979,6 +1988,10 @@ void dual_peer_disconnected(unsigned client_id) {
     if (ds.slot_id[s] == (int)client_id) {
       dual_send_all(DPK_BYE, NULL, 0, NULL, 0);
       dual_stop(ds.state == DS_RUN ? "Cable Link: a console left" : NULL);
+      // Two players: nobody else is left, the cable waits for the next
+      // console (it would be off until netplay started again).
+      if (ds.n == 2)
+        dual_session_start(0);
       return;
     }
 }
@@ -2152,6 +2165,9 @@ int dual_frame_begin(u32 local_keys) {
     netpacket_poll_receive();
     usleep(250);
   }
+  // (A console that left while we waited: the cable may be gone.)
+  if (ds.state != DS_RUN)
+    return DUAL_FRAME_WAIT;
 
   // A player pressed reset: every console restarts every game in this very
   // frame, with the cable plugged again (as at the start of the session).
