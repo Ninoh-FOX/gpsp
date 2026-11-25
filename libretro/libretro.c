@@ -758,6 +758,9 @@ static void netpacket_start(uint16_t client_id, retro_netpacket_send_t send_fn, 
   netpacket_pollrcv_fn_ptr = poll_receive_fn;
   netplay_num_clients = 0;
   netplay_client_id = client_id;
+#ifndef GPSP_INSTANCE_B
+  dual_clear_disconnects();
+#endif
 
   if (serial_mode == SERIAL_MODE_SERIAL_CABLE) {
     serialcable_session_reset();
@@ -875,7 +878,7 @@ static void netpacket_disconnected(uint16_t client_id) {
 #ifndef GPSP_INSTANCE_B
   if (serial_mode == SERIAL_MODE_SERIAL_CABLE ||
       serial_mode == SERIAL_MODE_DUAL_CABLE)
-    dual_peer_disconnected(client_id);
+    dual_peer_disconnected(client_id, netplay_num_clients);
 #endif
   if (serial_mode == SERIAL_MODE_SERIAL_CABLE)
     serialcable_peer_disconnected(client_id);
@@ -1954,6 +1957,7 @@ void retro_run(void)
    unsigned audio_frames = 1;
 
 #ifndef GPSP_INSTANCE_B
+   dual_drain_disconnects();
    if (dual_take_boot_reset())
       cable_boot_pending = true;
    /* The link is over: the options changed meanwhile apply now. */
