@@ -709,7 +709,11 @@ u32 dual_machine_cfg(void)
                      translation_gate_targets,
                      /* (the sound channels' length and envelope counters,
                       * which the game reads, step at this rate) */
-                     sound_freq_bits };
+                     sound_freq_bits,
+                     /* CPU semantics revision: materialize Thumb NZCV at
+                      * stores and preserve C/V through TST. Old replicas
+                      * with the same settings must use the real-time cable. */
+                     1u };
    for (i = 0; i < sizeof(v) / sizeof(v[0]); i++)
       cfg = (cfg ^ v[i]) * 16777619u;
    for (i = 0; i < translation_gate_targets; i++)
