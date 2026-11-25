@@ -2453,7 +2453,10 @@ void translate_icache_sync() {
                                                                               \
     /* TST, NEG, CMP, CMN */                                                  \
     case 0x42:                                                                \
-      thumb_flag_modifies_all();                                              \
+      if ((opcode & 0x00C0) == 0) /* TST preserves C and V */                 \
+        thumb_flag_modifies_zn();                                             \
+      else                                                                    \
+        thumb_flag_modifies_all();                                            \
       break;                                                                  \
                                                                               \
     /* ORR, MUL, BIC, MVN */                                                  \
@@ -2466,9 +2469,23 @@ void translate_icache_sync() {
       thumb_flag_modifies_all();                                              \
       break;                                                                  \
                                                                               \
-    /* mov might change PC (fall through if so) */                            \
+    /* Stores can leave the translated block for DMA, HALT or an IRQ. */      \
+    case 0x50 ... 0x51: /* STR register offset */                             \
+    case 0x52 ... 0x53: /* STRH register offset */                            \
+    case 0x54 ... 0x55: /* STRB register offset */                            \
+    case 0x60 ... 0x67: /* STR immediate */                                   \
+    case 0x70 ... 0x77: /* STRB immediate */                                  \
+    case 0x80 ... 0x87: /* STRH immediate */                                  \
+    case 0x90 ... 0x97: /* STR SP-relative */                                 \
+    case 0xB4 ... 0xB5: /* PUSH */                                            \
+    case 0xC0 ... 0xC7: /* STMIA */                                           \
+      thumb_flag_requires_all();                                              \
+      break;                                                                  \
+                                                                              \
+    /* High-register ADD/MOV can exit if the destination is PC. */            \
+    case 0x44:                                                                \
     case 0x46:                                                                \
-      if((opcode & 0xFF87) != 0x4687)                                         \
+      if ((opcode & 0x0087) != 0x0087)                                        \
         break;                                                                \
                                                                               \
     /* branches (can change PC) */                                            \

@@ -198,11 +198,11 @@ static int *const hid_dynarec[DUAL_HIDDEN] = {
 #define DPK_ROMOK          13  // the other GBAs are loaded (0), or DUAL_WHY_*
 
 // Why the real time cable is used instead.
-#define DUAL_WHY_DIFFER    0
 #define DUAL_WHY_PLAYERS   1
 #define DUAL_WHY_NOROM     2   // a console does not have another's game
 #define DUAL_WHY_MEMORY    3   // ...or no room for it
 #define DUAL_WHY_OTHER     4   // other games, and the host does not look for them
+#define DUAL_WHY_DIFFER    5   // ROMOK reserves 0 for success
 
 #define DUAL_START_BUILTIN 0x1 // START flags: the BIOS differ, all use the built-in one
 #define DUAL_START_OTHER   0x2 // ...the games differ: each console loads the others' games
